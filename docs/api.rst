@@ -136,6 +136,7 @@ Streams and stream wrappers
 
 .. autoclass:: anyio.streams.buffered.BufferedByteReceiveStream
 .. autoclass:: anyio.streams.buffered.BufferedByteStream
+.. autoclass:: anyio.streams.buffered.BufferedReceiveCheckpoint
 .. autoclass:: anyio.streams.file.FileStreamAttribute
 .. autoclass:: anyio.streams.file.FileReadStream
 .. autoclass:: anyio.streams.file.FileWriteStream
@@ -274,6 +275,7 @@ Exceptions
 .. autoexception:: anyio.BrokenResourceError
 .. autoexception:: anyio.BrokenWorkerInterpreter
 .. autoexception:: anyio.BrokenWorkerProcess
+.. autoexception:: anyio.BufferFullError
 .. autoexception:: anyio.BusyResourceError
 .. autoexception:: anyio.ClosedResourceError
 .. autoexception:: anyio.ConnectionFailed

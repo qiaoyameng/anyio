@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``BufferedByteReceiveStream.checkpoint()`` context manager which retains
+  received bytes so they can be rolled back unless the checkpoint is explicitly
+  committed, along with the ``anyio.BufferFullError`` exception raised when a
+  checkpoint's retention limit would be exceeded
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

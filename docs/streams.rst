@@ -179,6 +179,47 @@ The above script gives the following output::
 .. tip:: In some cases, you may need to inject data directly into the buffer. You can do
     that with the :meth:`~.streams.buffered.BufferedByteReceiveStream.feed_data` method.
 
+Checkpoints
+~~~~~~~~~~~
+
+When the appropriate way to parse the incoming data depends on an initial portion of
+it (as with protocol sniffing), you can use a checkpoint to tentatively receive bytes
+and then roll them back if they did not match your expectations. Bytes received while
+a checkpoint is active are retained in the buffer, and are only discarded when the
+checkpoint is explicitly committed. If the checkpoint block is exited without a
+commit – normally, via an exception or via cancellation – the receive position is
+restored to where it was when the checkpoint was entered::
+
+    from anyio import run, create_memory_object_stream
+    from anyio.streams.buffered import BufferedByteReceiveStream
+
+
+    async def main():
+        send, receive = create_memory_object_stream[bytes](4)
+        buffered = BufferedByteReceiveStream(receive)
+        await send.send(b'hello, world!')
+
+        with buffered.checkpoint(max_bytes=100) as checkpoint:
+            header = await buffered.receive_exactly(5)
+            if header == b'hello':
+                # The header was recognized, so the received bytes are consumed
+                checkpoint.commit()
+
+        # Prints b'hello, w' if the checkpoint was not committed, or b', world!'
+        # if it was
+        print(await buffered.receive_exactly(8))
+
+    run(main)
+
+Checkpoints can be nested. Committing an inner checkpoint does not prevent an outer
+checkpoint from rolling back the bytes received while the inner checkpoint was
+active.
+
+The ``max_bytes`` argument bounds the number of uncommitted bytes retained in the
+buffer while the checkpoint is active. If a receive operation would exceed this
+limit, :exc:`~anyio.BufferFullError` is raised before any unrecoverable data is
+consumed.
+
 Text streams
 ------------
 

@@ -58,6 +58,17 @@ class BrokenWorkerInterpreter(Exception):
             )
 
 
+class BufferFullError(Exception):
+    """
+    Raised when a receive operation on a
+    :class:`~anyio.streams.buffered.BufferedByteReceiveStream` would cause an active
+    checkpoint to retain more bytes than its configured maximum.
+    """
+
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"The checkpoint cannot retain more than {max_bytes} bytes")
+
+
 class BusyResourceError(Exception):
     """
     Raised when two tasks are trying to read from or write to the same resource
