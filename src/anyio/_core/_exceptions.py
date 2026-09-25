@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from textwrap import dedent
 from typing import Any
 
@@ -142,6 +142,26 @@ class NoEventLoopError(RuntimeError):
     This is also raised by :func:`.from_thread.run` and :func:`.from_thread.run_sync`
     if not calling from an AnyIO worker thread, and no ``token`` was passed.
     """
+
+
+class ProcessPipelineError(Exception):
+    """
+    Raised by :func:`~anyio.create_process_pipeline` when one or more processes in the
+    pipeline exited with a nonzero return code.
+
+    :ivar commands: the commands that were run in the pipeline
+    :ivar returncodes: the exit code of each process in the pipeline
+    """
+
+    def __init__(
+        self, commands: Sequence[Sequence[Any]], returncodes: Sequence[int]
+    ) -> None:
+        super().__init__(
+            "the process pipeline exited with nonzero return codes: "
+            + ", ".join(str(returncode) for returncode in returncodes)
+        )
+        self.commands = [list(command) for command in commands]
+        self.returncodes = list(returncodes)
 
 
 class RunFinishedError(RuntimeError):

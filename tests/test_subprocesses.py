@@ -9,6 +9,7 @@ from subprocess import DEVNULL, CalledProcessError
 from textwrap import dedent
 from typing import Any
 
+import psutil
 import pytest
 from pytest_mock.plugin import MockerFixture
 
@@ -17,10 +18,15 @@ from anyio import (
     CancelScope,
     ClosedResourceError,
     EndOfStream,
+    ProcessPipeline,
+    ProcessPipelineError,
+    create_process_pipeline,
     create_task_group,
     fail_after,
+    move_on_after,
     open_process,
     run_process,
+    sleep_forever,
 )
 from anyio._core._eventloop import get_async_backend
 from anyio.streams.buffered import BufferedByteReceiveStream
@@ -493,3 +499,217 @@ async def test_close_with_stdout_blocked_subprocess(anyio_backend_name: str) -> 
             process._process._transport.close()  # type: ignore[attr-defined]
 
         pytest.fail("Process.aclose() deadlocked")
+
+
+async def test_process_pipeline() -> None:
+    commands = [
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.stdout.write(sys.stdin.read().upper()); "
+                "sys.stderr.write('one')"
+            ),
+        ],
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.stdout.write(sys.stdin.read()[::-1]); "
+                "sys.stderr.write('two')"
+            ),
+        ],
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; sys.stdout.write(sys.stdin.read().strip()); "
+                "sys.stderr.write('three')"
+            ),
+        ],
+    ]
+    with fail_after(10):
+        async with create_process_pipeline(commands) as pipeline:
+            assert pipeline.stdin is not None
+            assert pipeline.stdout is not None
+            await pipeline.stdin.send(b"hello\n")
+            await pipeline.stdin.aclose()
+            output = b""
+            async for chunk in pipeline.stdout:
+                output += chunk
+
+    assert output == b"OLLEH"
+    assert pipeline.stderr == [b"one", b"two", b"three"]
+    assert pipeline.returncodes == [0, 0, 0]
+    assert len(pipeline.processes) == 3
+
+
+async def test_process_pipeline_large_output() -> None:
+    """Test that lots of data on both stdout and stderr does not deadlock."""
+    total = 8 * 1024 * 1024
+    stderr_size = 200_000  # larger than any platform's pipe buffer
+    producer = (
+        "import sys\n"
+        f"sys.stderr.write('e' * {stderr_size})\n"
+        "data = b'x' * 65536\n"
+        f"for _ in range({total // 65536}):\n"
+        "    sys.stdout.buffer.write(data)\n"
+        "sys.stdout.buffer.flush()\n"
+    )
+    passthrough = (
+        "import sys\n"
+        "while chunk := sys.stdin.buffer.read(65536):\n"
+        "    sys.stdout.buffer.write(chunk)\n"
+        "sys.stdout.buffer.flush()\n"
+    )
+    commands = [
+        [sys.executable, "-c", producer],
+        [sys.executable, "-c", passthrough],
+        [sys.executable, "-c", passthrough],
+    ]
+    received = 0
+    with fail_after(60):
+        async with create_process_pipeline(commands) as pipeline:
+            assert pipeline.stdout is not None
+            async for chunk in pipeline.stdout:
+                received += len(chunk)
+
+    assert received == total
+    assert pipeline.stderr[0] == b"e" * stderr_size
+    assert pipeline.stderr[1:] == [b"", b""]
+    assert pipeline.returncodes == [0, 0, 0]
+
+
+async def test_process_pipeline_early_exit() -> None:
+    """
+    Test that when a downstream process exits early, the remaining processes exit
+    and are reaped when the context manager is exited.
+    """
+    commands = [
+        [
+            sys.executable,
+            "-c",
+            ("import sys\nwhile True:\n    sys.stdout.buffer.write(b'x' * 65536)\n"),
+        ],
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+    ]
+    with fail_after(10):
+        async with create_process_pipeline(commands, check=False) as pipeline:
+            assert pipeline.stdout is not None
+            async for _ in pipeline.stdout:
+                pass
+
+    assert all(returncode is not None for returncode in pipeline.returncodes)
+    assert pipeline.returncodes[-1] == 0
+
+
+async def test_process_pipeline_exit_with_full_pipe() -> None:
+    """
+    Test that exiting the context manager while the last process is blocked writing
+    to a full stdout pipe does not deadlock, and reaps all the processes.
+    """
+    passthrough = (
+        "import sys\n"
+        "while chunk := sys.stdin.buffer.read(65536):\n"
+        "    sys.stdout.buffer.write(chunk)\n"
+        "sys.stdout.buffer.flush()\n"
+    )
+    commands = [
+        [
+            sys.executable,
+            "-c",
+            ("import sys\nwhile True:\n    sys.stdout.buffer.write(b'x' * 65536)\n"),
+        ],
+        [sys.executable, "-c", passthrough],
+    ]
+    with fail_after(10):
+        async with create_process_pipeline(commands, check=False) as pipeline:
+            assert pipeline.stdout is not None
+            async for chunk in pipeline.stdout:
+                if chunk:
+                    break
+
+    assert all(returncode is not None for returncode in pipeline.returncodes)
+    assert psutil.Process().children() == []
+
+
+async def test_process_pipeline_missing_command(tmp_path: Path) -> None:
+    """
+    Test that when a command in the middle of the pipeline fails to start, the
+    processes that were already started are killed and reaped.
+    """
+    commands = [
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        [str(tmp_path / "nonexistent_command")],
+    ]
+    with pytest.raises(FileNotFoundError), fail_after(10):
+        async with create_process_pipeline(commands):
+            pass
+
+    # No processes may be left running or unreaped
+    assert psutil.Process().children() == []
+
+
+async def test_process_pipeline_cancelled() -> None:
+    """
+    Test that cancelling the task running the pipeline kills and reaps all the
+    processes in the pipeline.
+    """
+    commands = [
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+    ]
+    pipeline: ProcessPipeline | None = None
+    with move_on_after(1):
+        async with create_process_pipeline(commands, check=False) as pipeline_:
+            pipeline = pipeline_
+            await sleep_forever()
+
+    assert pipeline is not None
+    assert all(returncode is not None for returncode in pipeline.returncodes)
+    assert psutil.Process().children() == []
+
+
+async def test_process_pipeline_check() -> None:
+    """Test that check=True reports the exit codes of all failing stages."""
+    commands = [
+        [sys.executable, "-c", "import sys; sys.exit(3)"],
+        [sys.executable, "-c", "import sys; sys.exit(0)"],
+        [sys.executable, "-c", "import sys; sys.exit(5)"],
+    ]
+    with pytest.raises(ProcessPipelineError) as exc_info, fail_after(10):
+        async with create_process_pipeline(commands, check=True):
+            pass
+
+    assert exc_info.value.returncodes == [3, 0, 5]
+    assert exc_info.value.commands == commands
+
+
+@pytest.mark.parametrize(
+    "commands, expected_exception",
+    [
+        pytest.param([], ValueError, id="no-commands"),
+        pytest.param(
+            [[sys.executable, "-c", "pass"]],
+            ValueError,
+            id="single-command",
+        ),
+        pytest.param(
+            ["echo hello", [sys.executable, "-c", "pass"]],
+            TypeError,
+            id="string-command",
+        ),
+        pytest.param(
+            [[sys.executable, "-c", "pass"], []],
+            ValueError,
+            id="empty-command",
+        ),
+    ],
+)
+async def test_process_pipeline_invalid_commands(
+    commands: list[Any], expected_exception: type[Exception]
+) -> None:
+    with pytest.raises(expected_exception):
+        async with create_process_pipeline(commands):
+            pass

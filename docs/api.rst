@@ -187,8 +187,10 @@ Subprocesses
 
 .. autofunction:: anyio.run_process
 .. autofunction:: anyio.open_process
+.. autofunction:: anyio.create_process_pipeline
 
 .. autoclass:: anyio.abc.Process
+.. autoclass:: anyio.ProcessPipeline
 
 Synchronization
 ---------------

@@ -38,6 +38,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._exceptions import FutureNotFinished as FutureNotFinished
     from ._core._exceptions import IncompleteRead as IncompleteRead
     from ._core._exceptions import NoEventLoopError as NoEventLoopError
+    from ._core._exceptions import ProcessPipelineError as ProcessPipelineError
     from ._core._exceptions import RunFinishedError as RunFinishedError
     from ._core._exceptions import TaskCancelled as TaskCancelled
     from ._core._exceptions import TaskFailed as TaskFailed
@@ -80,6 +81,8 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._streams import (
         create_memory_object_stream as create_memory_object_stream,
     )
+    from ._core._subprocesses import ProcessPipeline as ProcessPipeline
+    from ._core._subprocesses import create_process_pipeline as create_process_pipeline
     from ._core._subprocesses import open_process as open_process
     from ._core._subprocesses import run_process as run_process
     from ._core._synchronization import CapacityLimiter as CapacityLimiter
