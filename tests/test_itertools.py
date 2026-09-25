@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import itertools
+import sys
 from collections.abc import (
     AsyncGenerator,
     AsyncIterable,
     AsyncIterator,
+    Generator,
     Iterable,
     Iterator,
 )
@@ -32,6 +35,7 @@ from anyio.itertools import (
     starmap,
     takewhile,
     tee,
+    zip,
     zip_longest,
 )
 from anyio.lowlevel import (
@@ -39,6 +43,9 @@ from anyio.lowlevel import (
     checkpoint,
     checkpoint_if_cancelled,
 )
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
 
 T = TypeVar("T")
 
@@ -68,6 +75,42 @@ class AIter(AsyncIterator[T]):
 
 def aiter_from(iterable: Iterable[T]) -> AsyncIterator[T]:
     return AIter(iterable)
+
+
+def counting_generator(counter: list[int]) -> Generator[int, None, None]:
+    for value in itertools.count():
+        counter[0] += 1
+        yield value
+
+
+class TrackingAsyncIterable(AsyncIterable[int]):
+    """Async iterable whose iterators record pulls and aclose() calls."""
+
+    def __init__(self, close_error: Exception | None = None) -> None:
+        self.pulls = 0
+        self.closed = False
+        self.close_error = close_error
+
+    def __aiter__(self) -> TrackingAsyncIterator:
+        return TrackingAsyncIterator(self)
+
+
+class TrackingAsyncIterator(AsyncIterator[int]):
+    def __init__(self, iterable: TrackingAsyncIterable) -> None:
+        self._iterable = iterable
+
+    def __aiter__(self) -> TrackingAsyncIterator:
+        return self
+
+    async def __anext__(self) -> int:
+        self._iterable.pulls += 1
+        await checkpoint()
+        return self._iterable.pulls
+
+    async def aclose(self) -> None:
+        self._iterable.closed = True
+        if self._iterable.close_error is not None:
+            raise self._iterable.close_error
 
 
 async def assert_cancelled_on_first_next(iterator: AsyncIterator[Any]) -> None:
@@ -985,6 +1028,155 @@ class TestTee:
         iterator1, iterator2 = tee([1])
         assert await anext(iterator1) == 1
         await assert_cancelled_on_first_next(iterator2)
+
+
+class TestZip:
+    async def test_basic_cases(self) -> None:
+        cases = [
+            (zip([1, 2, 3], "ab"), [(1, "a"), (2, "b")]),
+            (zip(aiter_from([1, 2]), [10, 20, 30]), [(1, 10), (2, 20)]),
+            (
+                zip([1, 2], aiter_from("ab"), [1.5, 2.5]),
+                [(1, "a", 1.5), (2, "b", 2.5)],
+            ),
+            (zip([1, 2], "ab", strict=True), [(1, "a"), (2, "b")]),
+            (zip([], ()), []),
+            (zip(), []),
+        ]
+        for iterator, expected in cases:
+            assert await collect(iterator) == expected
+
+    async def test_checkpoints_empty_results(self) -> None:
+        for iterator in (zip([], ()), zip()):
+            await assert_cancelled_on_first_next(iterator)
+
+    async def test_strict_shorter(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"zip\(\) argument 2 is shorter than argument 1"
+        ):
+            await collect(zip([1, 2, 3], "ab", strict=True))
+
+    async def test_strict_shorter_multiple(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"zip\(\) argument 3 is shorter than arguments 1-2"
+        ):
+            await collect(zip([1, 2, 3], "abc", [1, 2], strict=True))
+
+    async def test_strict_longer(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"zip\(\) argument 2 is longer than argument 1"
+        ):
+            await collect(zip([1], [10, 20], strict=True))
+
+    async def test_strict_longer_multiple(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"zip\(\) argument 3 is longer than arguments 1-2"
+        ):
+            await collect(zip([1], [10], [5, 6], strict=True))
+
+    async def test_pulls_at_most_one_element_per_iterable_per_round(self) -> None:
+        counter = [0]
+        assert await collect(zip([1, 2, 3], counting_generator(counter))) == [
+            (1, 0),
+            (2, 1),
+            (3, 2),
+        ]
+        assert counter[0] == 3
+
+    async def test_pulls_at_most_one_extra_element_from_first_iterable(self) -> None:
+        counter = [0]
+        assert await collect(zip(counting_generator(counter), [1, 2, 3])) == [
+            (0, 1),
+            (1, 2),
+            (2, 3),
+        ]
+        assert counter[0] == 4
+
+    async def test_strict_longer_pulls_only_one_extra_element(self) -> None:
+        counter = [0]
+        with pytest.raises(ValueError, match="longer than"):
+            await collect(zip([1], counting_generator(counter), strict=True))
+
+        assert counter[0] == 2
+
+    async def test_same_iterator_passed_twice(self) -> None:
+        sync_iterator = iter([1, 2, 3, 4])
+        assert await collect(zip(sync_iterator, sync_iterator)) == [(1, 2), (3, 4)]
+
+        async_iterator = aiter_from([1, 2, 3, 4])
+        assert await collect(zip(async_iterator, async_iterator)) == [(1, 2), (3, 4)]
+
+    async def test_closes_owned_iterators_on_error(self) -> None:
+        tracker = TrackingAsyncIterable()
+
+        async def fail() -> AsyncGenerator[int, None]:
+            yield 1
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await collect(zip(tracker, fail()))
+
+        assert tracker.closed
+
+    async def test_closes_owned_iterators_on_cancellation(self) -> None:
+        tracker = TrackingAsyncIterable()
+        iterator = zip(tracker, [1, 2, 3])
+        with CancelScope() as cancel_scope:
+            cancel_scope.cancel()
+            with pytest.raises(get_cancelled_exc_class()):
+                await anext(iterator)
+
+        assert tracker.closed
+
+    async def test_closes_owned_iterators_on_aclose(self) -> None:
+        tracker = TrackingAsyncIterable()
+        iterator = zip(tracker, [1, 2, 3])
+        assert await anext(iterator) == (1, 1)
+        await iterator.aclose()
+        assert tracker.closed
+
+    async def test_does_not_close_borrowed_iterators(self) -> None:
+        closed = False
+
+        async def agen() -> AsyncGenerator[int, None]:
+            nonlocal closed
+            try:
+                yield 1
+                yield 2
+            finally:
+                closed = True
+
+        async_iterator = agen()
+        assert await collect(zip(async_iterator, [10])) == [(1, 10)]
+        assert not closed
+        await async_iterator.aclose()
+        assert closed
+
+    async def test_cleanup_error_chains_original_failure(self) -> None:
+        tracker = TrackingAsyncIterable(close_error=RuntimeError("cleanup failed"))
+
+        async def fail() -> AsyncGenerator[int, None]:
+            raise ValueError("original failure")
+            yield  # pragma: no cover
+
+        with pytest.raises(RuntimeError, match="cleanup failed") as excinfo:
+            await collect(zip(tracker, fail()))
+
+        assert isinstance(excinfo.value.__context__, ValueError)
+
+    async def test_multiple_cleanup_errors_chain_original_failure(self) -> None:
+        tracker1 = TrackingAsyncIterable(close_error=RuntimeError("cleanup 1"))
+        tracker2 = TrackingAsyncIterable(close_error=RuntimeError("cleanup 2"))
+
+        async def fail() -> AsyncGenerator[int, None]:
+            raise ValueError("original failure")
+            yield  # pragma: no cover
+
+        with pytest.raises(ExceptionGroup) as excinfo:
+            await collect(zip(tracker1, tracker2, fail()))
+
+        assert len(excinfo.value.exceptions) == 2
+        assert isinstance(excinfo.value.__context__, ValueError)
 
 
 class TestZipLongest:
