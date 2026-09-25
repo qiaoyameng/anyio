@@ -5,6 +5,12 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added ``UDPSocket.receive_with_metadata()`` and ``UDPSocket.send_with_metadata()``
+  (along with ``UDPSocket.supports_packet_metadata`` and
+  ``anyio.abc.UDPPacketMetadata``) for receiving per-datagram metadata (local
+  destination address, interface index and truncation flag) and for sending datagrams
+  with a per-packet source address and/or outgoing interface, on platforms supporting
+  packet info ancillary data (currently Linux only)
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

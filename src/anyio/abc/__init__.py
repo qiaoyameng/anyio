@@ -18,6 +18,7 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._sockets import SocketAttribute as SocketAttribute
     from ._sockets import SocketListener as SocketListener
     from ._sockets import SocketStream as SocketStream
+    from ._sockets import UDPPacketMetadata as UDPPacketMetadata
     from ._sockets import UDPPacketType as UDPPacketType
     from ._sockets import UDPSocket as UDPSocket
     from ._sockets import UNIXDatagramPacketType as UNIXDatagramPacketType

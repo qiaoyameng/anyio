@@ -197,6 +197,40 @@ address and port every time you send data to the peer::
 
     run(main)
 
+Receiving packet metadata with UDP sockets
+------------------------------------------
+
+On platforms where packet info ancillary data is available (currently only Linux), a
+UDP socket can report, for each received datagram, the local destination address it
+was sent to, the index of the network interface it arrived on and whether its payload
+was truncated to fit the receive buffer. This is particularly useful for servers bound
+to a wildcard address that need to reply from the same address the client sent to::
+
+    import socket
+
+    from anyio import create_udp_socket, run
+
+
+    async def main():
+        async with await create_udp_socket(
+            family=socket.AF_INET, local_port=1234
+        ) as udp:
+            if not udp.supports_packet_metadata:
+                raise RuntimeError('packet metadata is not supported here')
+
+            while True:
+                packet, (host, port), metadata = await udp.receive_with_metadata()
+                await udp.send_with_metadata(
+                    b'Hello, ' + packet, (host, port),
+                    local_address=metadata.local_address)
+
+    run(main)
+
+Use :attr:`~anyio.abc.UDPSocket.supports_packet_metadata` to check whether the
+platform and event loop support this feature; on unsupported platforms,
+:meth:`~anyio.abc.UDPSocket.receive_with_metadata` and
+:meth:`~anyio.abc.UDPSocket.send_with_metadata` raise :exc:`NotImplementedError`.
+
 Working with UNIX datagram sockets
 ----------------------------------
 

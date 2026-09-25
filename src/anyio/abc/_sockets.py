@@ -5,6 +5,7 @@ import socket
 from abc import abstractmethod
 from collections.abc import Callable, Collection, Mapping
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from io import IOBase
 from ipaddress import IPv4Address, IPv6Address
 from socket import AddressFamily
@@ -27,6 +28,34 @@ SockAddrType: TypeAlias = IPSockAddrType | str
 UDPPacketType: TypeAlias = tuple[bytes, IPSockAddrType]
 UNIXDatagramPacketType: TypeAlias = tuple[bytes, str]
 T_Retval = TypeVar("T_Retval")
+
+
+@dataclass(frozen=True)
+class UDPPacketMetadata:
+    """
+    Contains metadata about a received UDP datagram.
+
+    .. attribute:: local_address
+        :type: str | None
+
+        the local IP address the datagram was addressed to (``None`` if unknown)
+
+    .. attribute:: interface_index
+        :type: int | None
+
+        the index of the network interface the datagram was received on (``None`` if
+        unknown)
+
+    .. attribute:: truncated
+        :type: bool
+
+        ``True`` if the datagram was too large for the receive buffer and its payload
+        was truncated
+    """
+
+    local_address: str | None
+    interface_index: int | None
+    truncated: bool
 
 
 def _validate_socket(
@@ -311,6 +340,61 @@ class UDPSocket(UnreliableObjectStream[UDPPacketType], _SocketProvider):
 
         """
         return await self.send((data, (host, port)))
+
+    @property
+    def supports_packet_metadata(self) -> bool:
+        """
+        ``True`` if :meth:`receive_with_metadata` and :meth:`send_with_metadata` are
+        supported on this platform.
+
+        """
+        return False
+
+    async def receive_with_metadata(
+        self, max_bytes: int = 65536
+    ) -> tuple[bytes, IPSockAddrType, UDPPacketMetadata]:
+        """
+        Receive a datagram along with its metadata.
+
+        The metadata contains the local destination address and interface index of the
+        datagram, which allows a server bound to a wildcard address to determine which
+        of its addresses the datagram was sent to, and to reply from the same address
+        via :meth:`send_with_metadata`.
+
+        :param max_bytes: maximum number of bytes to receive
+        :return: a tuple of (payload, remote address, metadata)
+        :raises NotImplementedError: if packet metadata is not supported on this
+            platform (see :attr:`supports_packet_metadata`)
+
+        """
+        raise NotImplementedError(
+            "UDP packet metadata is not supported on this platform"
+        )
+
+    async def send_with_metadata(
+        self,
+        data: bytes,
+        address: IPSockAddrType,
+        *,
+        local_address: str | None = None,
+        interface_index: int | None = None,
+    ) -> None:
+        """
+        Send a datagram, optionally overriding its source address and/or outgoing
+        interface for this packet only.
+
+        :param data: the payload to send
+        :param address: the destination address as a (host, port) tuple
+        :param local_address: the source IP address to send the datagram from
+        :param interface_index: the index of the network interface to send the
+            datagram on
+        :raises NotImplementedError: if packet metadata is not supported on this
+            platform (see :attr:`supports_packet_metadata`)
+
+        """
+        raise NotImplementedError(
+            "UDP packet metadata is not supported on this platform"
+        )
 
 
 class ConnectedUDPSocket(UnreliableObjectStream[bytes], _SocketProvider):

@@ -65,6 +65,7 @@ from .. import (
     TaskInfo,
     abc,
 )
+from .._core import _pktinfo
 from .._core._eventloop import (
     claim_worker_thread,
     set_current_async_library,
@@ -96,6 +97,7 @@ from ..abc import (
     AsyncBackend,
     IPSockAddrType,
     SocketListener,
+    UDPPacketMetadata,
     UDPPacketType,
     UNIXDatagramPacketType,
 )
@@ -1747,6 +1749,7 @@ class UDPSocket(abc.UDPSocket):
         self._protocol = protocol
         self._receive_guard = ResourceGuard("reading from")
         self._send_guard = ResourceGuard("writing to")
+        self._pktinfo_socket: socket.socket | None = None
         self._closed = False
 
     @property
@@ -1755,6 +1758,13 @@ class UDPSocket(abc.UDPSocket):
 
     async def aclose(self) -> None:
         self._closed = True
+        if self._pktinfo_socket is not None:
+            loop = get_running_loop()
+            loop.remove_reader(self._pktinfo_socket)
+            loop.remove_writer(self._pktinfo_socket)
+            self._pktinfo_socket.close()
+            self._pktinfo_socket = None
+
         if not self._transport.is_closing():
             self._transport.close()
 
@@ -1787,6 +1797,158 @@ class UDPSocket(abc.UDPSocket):
                 raise BrokenResourceError
             else:
                 self._transport.sendto(*item)
+
+    @property
+    def supports_packet_metadata(self) -> bool:
+        return (
+            _pktinfo.PACKET_INFO_SUPPORTED
+            # The transport must support pausing so that it can be prevented from
+            # consuming datagrams while they are received directly from the socket
+            # (not all event loops, e.g. uvloop, support this)
+            and hasattr(self._transport, "pause_reading")
+            and self._raw_socket.family
+            in (AddressFamily.AF_INET, AddressFamily.AF_INET6)
+        )
+
+    def _get_pktinfo_socket(self) -> socket.socket:
+        # The transport socket wrapper does not support recvmsg()/sendmsg(), so a
+        # duplicate of the underlying socket (sharing all socket state) is used
+        # instead
+        if self._pktinfo_socket is None:
+            self._pktinfo_socket = self._raw_socket.dup()
+            self._pktinfo_socket.setblocking(False)
+
+        return self._pktinfo_socket
+
+    async def _wait_pktinfo_readable(
+        self, loop: AbstractEventLoop, sock: socket.socket
+    ) -> None:
+        def on_closed(future: asyncio.Future[None]) -> None:
+            if not readable.done():
+                readable.set_result(None)
+
+        readable: asyncio.Future[None] = asyncio.Future()
+        loop.add_reader(sock, readable.set_result, None)
+        closed_waiter = asyncio.ensure_future(self._protocol.closed_event.wait())
+        closed_waiter.add_done_callback(on_closed)
+        try:
+            await readable
+        finally:
+            if sock.fileno() >= 0:
+                loop.remove_reader(sock)
+
+            closed_waiter.cancel()
+
+    async def _wait_pktinfo_writable(
+        self, loop: AbstractEventLoop, sock: socket.socket
+    ) -> None:
+        def on_closed(future: asyncio.Future[None]) -> None:
+            if not writable.done():
+                writable.set_result(None)
+
+        writable: asyncio.Future[None] = asyncio.Future()
+        loop.add_writer(sock, writable.set_result, None)
+        closed_waiter = asyncio.ensure_future(self._protocol.closed_event.wait())
+        closed_waiter.add_done_callback(on_closed)
+        try:
+            await writable
+        finally:
+            if sock.fileno() >= 0:
+                loop.remove_writer(sock)
+
+            closed_waiter.cancel()
+
+    async def receive_with_metadata(
+        self, max_bytes: int = 65536
+    ) -> tuple[bytes, IPSockAddrType, UDPPacketMetadata]:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        if not self.supports_packet_metadata:
+            raise NotImplementedError(
+                "UDP packet metadata is not supported on this platform"
+            )
+
+        loop = get_running_loop()
+        await AsyncIOBackend.checkpoint()
+        with self._receive_guard:
+            if self._closed:
+                raise ClosedResourceError
+
+            sock = self._get_pktinfo_socket()
+
+            # Pause the transport so that it does not consume incoming datagrams
+            # while they are being received directly from the socket
+            self._transport.pause_reading()
+            try:
+                while True:
+                    try:
+                        data, ancdata, flags, addr = sock.recvmsg(
+                            max_bytes, _pktinfo.ancillary_buffer_size()
+                        )
+                    except BlockingIOError:
+                        await self._wait_pktinfo_readable(loop, sock)
+                        if self._closed:
+                            raise ClosedResourceError
+                    except OSError as exc:
+                        if self._closed:
+                            raise ClosedResourceError from None
+                        else:
+                            raise BrokenResourceError from exc
+                    else:
+                        break
+            finally:
+                if not self._transport.is_closing():
+                    self._transport.resume_reading()
+
+        local_address, interface_index, truncated = _pktinfo.parse_packet_info(
+            ancdata, flags
+        )
+        metadata = UDPPacketMetadata(local_address, interface_index, truncated)
+        return data, convert_ipv6_sockaddr(addr), metadata
+
+    async def send_with_metadata(
+        self,
+        data: bytes,
+        address: IPSockAddrType,
+        *,
+        local_address: str | None = None,
+        interface_index: int | None = None,
+    ) -> None:
+        if not self.supports_packet_metadata:
+            raise NotImplementedError(
+                "UDP packet metadata is not supported on this platform"
+            )
+
+        loop = get_running_loop()
+        await AsyncIOBackend.checkpoint()
+        with self._send_guard:
+            if self._closed:
+                raise ClosedResourceError
+            elif self._transport.is_closing():
+                raise BrokenResourceError
+
+            # Wait for the transport's write buffer to drain so that datagrams sent
+            # via send() are not reordered with respect to this one
+            await self._protocol.write_event.wait()
+
+            sock = self._get_pktinfo_socket()
+            ancdata = _pktinfo.build_packet_info(
+                sock.family, local_address, interface_index
+            )
+            while True:
+                try:
+                    sock.sendmsg([data], ancdata, 0, address)
+                except BlockingIOError:
+                    await self._wait_pktinfo_writable(loop, sock)
+                    if self._closed:
+                        raise ClosedResourceError
+                except OSError as exc:
+                    if self._closed:
+                        raise ClosedResourceError from None
+                    else:
+                        raise BrokenResourceError from exc
+                else:
+                    return
 
 
 class ConnectedUDPSocket(abc.ConnectedUDPSocket):
@@ -2907,6 +3069,13 @@ class AsyncIOBackend(AsyncBackend):
             transport.close()
             raise protocol.exception
 
+        if _pktinfo.PACKET_INFO_SUPPORTED:
+            try:
+                _pktinfo.enable_packet_info(transport.get_extra_info("socket"))
+            except BaseException:
+                transport.close()
+                raise
+
         if not remote_address:
             return UDPSocket(transport, protocol)
         else:
@@ -3140,6 +3309,9 @@ class AsyncIOBackend(AsyncBackend):
 
     @classmethod
     async def wrap_udp_socket(cls, sock: socket.socket) -> UDPSocket:
+        if _pktinfo.PACKET_INFO_SUPPORTED:
+            _pktinfo.enable_packet_info(sock)
+
         transport, protocol = await get_running_loop().create_datagram_endpoint(
             DatagramProtocol, sock=sock
         )
@@ -3147,6 +3319,9 @@ class AsyncIOBackend(AsyncBackend):
 
     @classmethod
     async def wrap_connected_udp_socket(cls, sock: socket.socket) -> ConnectedUDPSocket:
+        if _pktinfo.PACKET_INFO_SUPPORTED:
+            _pktinfo.enable_packet_info(sock)
+
         transport, protocol = await get_running_loop().create_datagram_endpoint(
             DatagramProtocol, sock=sock
         )

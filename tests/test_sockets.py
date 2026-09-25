@@ -65,7 +65,9 @@ from anyio import (
     wait_socket_writable,
     wait_writable,
 )
+from anyio._core import _pktinfo
 from anyio._core._eventloop import get_async_backend
+from anyio._core._pktinfo import PACKET_INFO_SUPPORTED
 from anyio.abc import (
     AnyByteStream,
     ConnectedUDPSocket,
@@ -75,6 +77,7 @@ from anyio.abc import (
     SocketAttribute,
     SocketListener,
     SocketStream,
+    UDPPacketMetadata,
     UDPSocket,
     UNIXDatagramSocket,
     UNIXSocketStream,
@@ -116,6 +119,10 @@ skip_ipv6_mark = pytest.mark.skipif(not has_ipv6, reason="IPv6 is not available"
 skip_unix_abstract_mark = pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="Abstract namespace sockets is a Linux only feature",
+)
+skip_no_pktinfo_mark = pytest.mark.skipif(
+    not PACKET_INFO_SUPPORTED,
+    reason="packet info ancillary data is not supported on this platform",
 )
 
 
@@ -2003,6 +2010,157 @@ class TestUDPSocket:
             match="socket type mismatch: expected SOCK_DGRAM, got SOCK_STREAM",
         ):
             await UDPSocket.from_socket(sock_or_fd)
+
+
+@pytest.mark.network
+class TestUDPPacketMetadata:
+    @staticmethod
+    def require_packet_metadata(udp: UDPSocket) -> None:
+        if not udp.supports_packet_metadata:
+            pytest.skip("packet metadata is not supported with this event loop")
+
+    @skip_no_pktinfo_mark
+    async def test_reply_from_destination_address(self) -> None:
+        """
+        Test that a server bound to a wildcard address can tell which local address
+        each datagram was sent to, and reply from the same address.
+        """
+
+        async def serve() -> None:
+            while True:
+                data, addr, metadata = await server.receive_with_metadata()
+                assert isinstance(metadata, UDPPacketMetadata)
+                assert metadata.local_address in {"127.0.0.1", "127.0.0.2"}
+                assert metadata.interface_index == socket.if_nametoindex("lo")
+                assert not metadata.truncated
+                await server.send_with_metadata(
+                    data,
+                    addr,
+                    local_address=metadata.local_address,
+                    interface_index=metadata.interface_index,
+                )
+
+        async with await create_udp_socket(family=AddressFamily.AF_INET) as server:
+            self.require_packet_metadata(server)
+            port = server.extra(SocketAttribute.local_port)
+            async with (
+                await create_udp_socket(
+                    family=AddressFamily.AF_INET, local_host="127.0.0.1"
+                ) as client,
+                create_task_group() as tg,
+            ):
+                tg.start_soon(serve)
+                for host in "127.0.0.1", "127.0.0.2":
+                    await client.sendto(b"hello", host, port)
+                    response, addr = await client.receive()
+                    assert response == b"hello"
+                    assert addr == (host, port)
+
+                tg.cancel_scope.cancel()
+
+    @skip_no_pktinfo_mark
+    async def test_empty_datagram(self) -> None:
+        async with await create_udp_socket(
+            family=AddressFamily.AF_INET, local_host="127.0.0.1"
+        ) as udp:
+            self.require_packet_metadata(udp)
+            host, port = cast(
+                tuple[str, int], udp.extra(SocketAttribute.local_address)
+            )
+            await udp.send_with_metadata(b"", (host, port))
+            data, addr, metadata = await udp.receive_with_metadata()
+            assert data == b""
+            assert addr == (host, port)
+            assert metadata.local_address == "127.0.0.1"
+            assert metadata.interface_index == socket.if_nametoindex("lo")
+            assert not metadata.truncated
+
+    @skip_no_pktinfo_mark
+    @skip_ipv6_mark
+    async def test_ipv6(self) -> None:
+        async with await create_udp_socket(
+            family=AddressFamily.AF_INET6, local_host="::1"
+        ) as udp:
+            self.require_packet_metadata(udp)
+            host, port = cast(
+                tuple[str, int], udp.extra(SocketAttribute.local_address)
+            )
+            await udp.send_with_metadata(b"foo", (host, port), local_address="::1")
+            data, addr, metadata = await udp.receive_with_metadata()
+            assert data == b"foo"
+            assert addr == (host, port)
+            assert metadata.local_address == "::1"
+            assert metadata.interface_index == socket.if_nametoindex("lo")
+            assert not metadata.truncated
+
+    @skip_no_pktinfo_mark
+    async def test_truncated_datagram(self) -> None:
+        async with await create_udp_socket(
+            family=AddressFamily.AF_INET, local_host="127.0.0.1"
+        ) as udp:
+            self.require_packet_metadata(udp)
+            host, port = cast(
+                tuple[str, int], udp.extra(SocketAttribute.local_address)
+            )
+            await udp.send_with_metadata(b"x" * 100, (host, port))
+            data, addr, metadata = await udp.receive_with_metadata(10)
+            assert data == b"x" * 10
+            assert metadata.truncated
+
+    @skip_no_pktinfo_mark
+    async def test_cancelled_receive(self) -> None:
+        async with await create_udp_socket(
+            family=AddressFamily.AF_INET, local_host="127.0.0.1"
+        ) as udp:
+            self.require_packet_metadata(udp)
+            host, port = cast(
+                tuple[str, int], udp.extra(SocketAttribute.local_address)
+            )
+            with move_on_after(1):
+                await udp.receive_with_metadata()
+                pytest.fail("receive_with_metadata() should have been cancelled")
+
+            # The socket must still be usable for metadata receives
+            await udp.send_with_metadata(b"foo", (host, port))
+            data, addr, metadata = await udp.receive_with_metadata()
+            assert data == b"foo"
+            assert metadata.local_address == "127.0.0.1"
+
+            # ...and for plain receives
+            await udp.sendto(b"bar", host, port)
+            assert await udp.receive() == (b"bar", (host, port))
+
+    @skip_no_pktinfo_mark
+    async def test_close_during_receive(self) -> None:
+        async def close_when_blocked() -> None:
+            await wait_all_tasks_blocked()
+            await udp.aclose()
+
+        async with (
+            await create_udp_socket(
+                family=AddressFamily.AF_INET, local_host="127.0.0.1"
+            ) as udp,
+            create_task_group() as tg,
+        ):
+            self.require_packet_metadata(udp)
+            tg.start_soon(close_when_blocked)
+            with pytest.raises(ClosedResourceError):
+                await udp.receive_with_metadata()
+
+    async def test_metadata_not_supported(self, monkeypatch: MonkeyPatch) -> None:
+        monkeypatch.setattr(_pktinfo, "PACKET_INFO_SUPPORTED", False)
+        async with await create_udp_socket(
+            family=AddressFamily.AF_INET, local_host="127.0.0.1"
+        ) as udp:
+            host, port = cast(
+                tuple[str, int], udp.extra(SocketAttribute.local_address)
+            )
+            assert not udp.supports_packet_metadata
+            with pytest.raises(NotImplementedError):
+                await udp.receive_with_metadata()
+
+            with pytest.raises(NotImplementedError):
+                await udp.send_with_metadata(b"foo", (host, port))
 
 
 @pytest.mark.network

@@ -61,6 +61,7 @@ from .. import (
     WouldBlock,
     abc,
 )
+from .._core import _pktinfo
 from .._core._eventloop import claim_worker_thread
 from .._core._exceptions import (
     BrokenResourceError,
@@ -630,6 +631,59 @@ class UDPSocket(_TrioSocketMixin[IPSockAddrType], abc.UDPSocket):
         with self._send_guard:
             try:
                 await self._trio_socket.sendto(*item)
+            except BaseException as exc:
+                self._convert_socket_error(exc)
+
+    @property
+    def supports_packet_metadata(self) -> bool:
+        return _pktinfo.PACKET_INFO_SUPPORTED and self._trio_socket.family in (
+            AddressFamily.AF_INET,
+            AddressFamily.AF_INET6,
+        )
+
+    async def receive_with_metadata(
+        self, max_bytes: int = 65536
+    ) -> tuple[bytes, IPSockAddrType, abc.UDPPacketMetadata]:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        if not self.supports_packet_metadata:
+            raise NotImplementedError(
+                "UDP packet metadata is not supported on this platform"
+            )
+
+        with self._receive_guard:
+            try:
+                data, ancdata, flags, addr = await self._trio_socket.recvmsg(
+                    max_bytes, _pktinfo.ancillary_buffer_size()
+                )
+            except BaseException as exc:
+                self._convert_socket_error(exc)
+
+        local_address, interface_index, truncated = _pktinfo.parse_packet_info(
+            ancdata, flags
+        )
+        metadata = abc.UDPPacketMetadata(local_address, interface_index, truncated)
+        return data, convert_ipv6_sockaddr(cast(Any, addr)), metadata
+
+    async def send_with_metadata(
+        self,
+        data: bytes,
+        address: IPSockAddrType,
+        *,
+        local_address: str | None = None,
+        interface_index: int | None = None,
+    ) -> None:
+        if not self.supports_packet_metadata:
+            raise NotImplementedError(
+                "UDP packet metadata is not supported on this platform"
+            )
+
+        ancdata = _pktinfo.build_packet_info(
+            self._trio_socket.family, local_address, interface_index
+        )
+        with self._send_guard:
+            try:
+                await self._trio_socket.sendmsg([data], ancdata, 0, address)
             except BaseException as exc:
                 self._convert_socket_error(exc)
 
@@ -1299,6 +1353,13 @@ class TrioBackend(AsyncBackend):
         if reuse_port:
             trio_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
+        if _pktinfo.PACKET_INFO_SUPPORTED:
+            try:
+                _pktinfo.enable_packet_info(trio_socket)
+            except BaseException:
+                trio_socket.close()
+                raise
+
         if local_address:
             await trio_socket.bind(local_address)
 
@@ -1400,11 +1461,17 @@ class TrioBackend(AsyncBackend):
 
     @classmethod
     async def wrap_udp_socket(cls, sock: socket.socket) -> UDPSocket:
+        if _pktinfo.PACKET_INFO_SUPPORTED:
+            _pktinfo.enable_packet_info(sock)
+
         trio_sock = trio.socket.from_stdlib_socket(sock)
         return UDPSocket(trio_sock)
 
     @classmethod
     async def wrap_connected_udp_socket(cls, sock: socket.socket) -> ConnectedUDPSocket:
+        if _pktinfo.PACKET_INFO_SUPPORTED:
+            _pktinfo.enable_packet_info(sock)
+
         trio_sock = trio.socket.from_stdlib_socket(sock)
         return ConnectedUDPSocket(trio_sock)
 
