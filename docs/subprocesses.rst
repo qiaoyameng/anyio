@@ -93,6 +93,45 @@ This is done by using :func:`.to_process.run_sync`::
     if __name__ == '__main__':
         run(main)
 
+Running one-time setup in worker processes
+******************************************
+
+If every worker process needs to do some expensive one-time setup before it can
+serve requests (such as loading a large dictionary or model into memory), you
+can pass an ``initializer`` callable along with ``initargs``, similar to
+:class:`multiprocessing.Pool`. The initializer is run once in each newly
+spawned worker process, before that worker handles its first request::
+
+    from anyio import run, to_process
+
+
+    def load_dictionary(path):
+        global dictionary
+        with open(path) as file:
+            dictionary = set(file.read().split())
+
+
+    def count_known_words(words):
+        return sum(word in dictionary for word in words)
+
+
+    async def main():
+        result = await to_process.run_sync(
+            count_known_words, ['hello', 'world'],
+            initializer=load_dictionary, initargs=('/usr/share/dict/words',),
+        )
+        print(result)
+
+    if __name__ == '__main__':
+        run(main)
+
+Worker processes are pooled per initializer configuration: two calls only share
+worker processes if the initializer and every element of ``initargs`` are
+identical (compared by object identity, not equality). Calls made with
+different initializers or initializer arguments therefore never reuse each
+other's worker processes. If the initializer raises an exception, it is
+propagated to the caller and the failed worker process is discarded.
+
 Technical details
 *****************
 

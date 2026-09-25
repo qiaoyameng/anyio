@@ -12,6 +12,7 @@ from pytest import MonkeyPatch
 
 from anyio import (
     CancelScope,
+    CapacityLimiter,
     create_task_group,
     fail_after,
     to_process,
@@ -123,19 +124,18 @@ async def test_exec_while_pruning() -> None:
     workers = to_process._process_pool_workers.get()
     idle_workers = to_process._process_pool_idle_workers.get()
     real_worker = next(iter(workers))
+    idle = idle_workers[to_process._InitializerKey(None, ())]
 
     fake_idle_process = Mock(Process)
     workers.add(fake_idle_process)
     try:
         # Add a mock worker process that's guaranteed to be eligible for pruning
-        idle_workers.appendleft(
-            (fake_idle_process, -to_process.WORKER_MAX_IDLE_TIME - 1)
-        )
+        idle.appendleft((fake_idle_process, -to_process.WORKER_MAX_IDLE_TIME - 1))
 
         worker_pid2 = await to_process.run_sync(os.getpid)
         assert worker_pid1 == worker_pid2
         fake_idle_process.kill.assert_called_once_with()
-        assert idle_workers[0][0] is real_worker
+        assert idle[0][0] is real_worker
     finally:
         workers.discard(fake_idle_process)
 
@@ -173,3 +173,206 @@ async def test_entrypoint_main_module(monkeypatch: MonkeyPatch, tmp_path: Path) 
     script_path.write_text("foo=3")
     monkeypatch.setattr("__main__.__file__", str(script_path))
     assert await to_process.run_sync(_check_main_importable) == 3
+
+
+_init_call_count = 0
+_init_arg: object = None
+
+
+def _counting_initializer() -> None:
+    global _init_call_count
+    _init_call_count += 1
+
+
+def _get_init_call_count() -> int:
+    return _init_call_count
+
+
+def _arg_storing_initializer(arg: object) -> None:
+    global _init_arg
+    _init_arg = arg
+
+
+def _get_init_arg() -> object:
+    return _init_arg
+
+
+def _failing_initializer(counter_path: str) -> None:
+    with open(counter_path, "a") as file:
+        file.write("x")
+
+    raise ValueError("initializer failed")
+
+
+async def test_initializer() -> None:
+    """
+    Test that the initializer runs once in the worker process, and that subsequent
+    calls with the same initializer reuse the initialized worker.
+    """
+    worker_pid = await to_process.run_sync(
+        os.getpid, initializer=_counting_initializer
+    )
+    assert worker_pid != os.getpid()
+    assert (
+        await to_process.run_sync(os.getpid, initializer=_counting_initializer)
+        == worker_pid
+    )
+    assert (
+        await to_process.run_sync(
+            _get_init_call_count, initializer=_counting_initializer
+        )
+        == 1
+    )
+
+
+async def test_initializer_initargs() -> None:
+    """Test that initargs are passed to the initializer in the worker process."""
+    initargs = ("config",)
+    worker_pid = await to_process.run_sync(
+        os.getpid, initializer=_arg_storing_initializer, initargs=initargs
+    )
+    assert (
+        await to_process.run_sync(
+            _get_init_arg, initializer=_arg_storing_initializer, initargs=initargs
+        )
+        == "config"
+    )
+    assert (
+        await to_process.run_sync(
+            os.getpid, initializer=_arg_storing_initializer, initargs=initargs
+        )
+        == worker_pid
+    )
+
+
+async def test_initializer_distinct_configurations() -> None:
+    """
+    Test that calls with different initializers or initargs never share worker
+    processes, and that interleaved calls each reuse the worker matching their
+    own configuration.
+    """
+    pid1 = await to_process.run_sync(
+        os.getpid, initializer=_arg_storing_initializer, initargs=("config1",)
+    )
+    pid2 = await to_process.run_sync(
+        os.getpid, initializer=_arg_storing_initializer, initargs=("config2",)
+    )
+    pid3 = await to_process.run_sync(os.getpid, initializer=_counting_initializer)
+    assert len({pid1, pid2, pid3}) == 3
+
+    # Interleaved calls reuse the worker initialized with the same configuration
+    assert (
+        await to_process.run_sync(os.getpid, initializer=_counting_initializer)
+        == pid3
+    )
+    assert (
+        await to_process.run_sync(
+            os.getpid, initializer=_arg_storing_initializer, initargs=("config1",)
+        )
+        == pid1
+    )
+    assert (
+        await to_process.run_sync(
+            _get_init_arg,
+            initializer=_arg_storing_initializer,
+            initargs=("config2",),
+        )
+        == "config2"
+    )
+
+
+async def test_initializer_key_identity() -> None:
+    """
+    Test that initializer configurations are compared by the identity of the
+    initializer and each of its arguments, not by equality.
+    """
+    shared_arg = ["config"]
+    worker_pid = await to_process.run_sync(
+        os.getpid, initializer=_arg_storing_initializer, initargs=(shared_arg,)
+    )
+
+    # The same argument object in a different tuple shares the worker pool
+    assert (
+        await to_process.run_sync(
+            os.getpid, initializer=_arg_storing_initializer, initargs=(shared_arg,)
+        )
+        == worker_pid
+    )
+
+    # A distinct but equal argument object gets its own worker pool
+    assert (
+        await to_process.run_sync(
+            os.getpid, initializer=_arg_storing_initializer, initargs=(["config"],)
+        )
+        != worker_pid
+    )
+
+
+async def test_initializer_exception(tmp_path: Path) -> None:
+    """
+    Test that an exception raised by the initializer is propagated to the caller,
+    and that the broken worker process is discarded instead of being pooled or
+    endlessly respawned.
+    """
+    counter_path = tmp_path / "counter"
+    for _ in range(2):
+        with pytest.raises(ValueError, match="initializer failed"):
+            await to_process.run_sync(
+                os.getpid,
+                initializer=_failing_initializer,
+                initargs=(str(counter_path),),
+            )
+
+    # Each call spawned a fresh worker whose initializer ran exactly once
+    assert counter_path.read_text() == "xx"
+
+    # No broken worker was left behind in the pools
+    assert not to_process._process_pool_workers.get()
+    assert not any(to_process._process_pool_idle_workers.get().values())
+
+
+@pytest.mark.usefixtures("deactivate_blockbuster")
+async def test_initializer_cancel_first_waiter() -> None:
+    """
+    Test that cancelling the first waiter on a worker process does not prevent a
+    queued waiter from getting a new, properly initialized worker process.
+    """
+    limiter = CapacityLimiter(1)
+    first_scope: CancelScope | None = None
+    second_pid: int | None = None
+
+    async def first_waiter() -> None:
+        nonlocal first_scope
+        with CancelScope() as first_scope:
+            await to_process.run_sync(
+                time.sleep,
+                5,
+                cancellable=True,
+                limiter=limiter,
+                initializer=_counting_initializer,
+            )
+
+    async def second_waiter() -> None:
+        nonlocal second_pid
+        second_pid = await to_process.run_sync(
+            os.getpid, limiter=limiter, initializer=_counting_initializer
+        )
+
+    with fail_after(10):
+        async with create_task_group() as tg:
+            tg.start_soon(first_waiter)
+            await wait_all_tasks_blocked()
+            tg.start_soon(second_waiter)
+            await wait_all_tasks_blocked()
+            assert first_scope is not None
+            first_scope.cancel()
+
+    assert second_pid is not None
+
+    # The replacement worker was initialized exactly once
+    assert (
+        await to_process.run_sync(
+            _get_init_call_count, limiter=limiter, initializer=_counting_initializer
+        )
+        == 1
+    )

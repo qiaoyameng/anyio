@@ -5,6 +5,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``initializer`` and ``initargs`` arguments to
+  ``anyio.to_process.run_sync()`` to allow running expensive one-time setup
+  (such as loading large data sets) in each worker process when it is spawned
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
