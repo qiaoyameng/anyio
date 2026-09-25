@@ -9,6 +9,7 @@ from subprocess import DEVNULL, CalledProcessError
 from textwrap import dedent
 from typing import Any
 
+import psutil
 import pytest
 from pytest_mock.plugin import MockerFixture
 
@@ -17,10 +18,13 @@ from anyio import (
     CancelScope,
     ClosedResourceError,
     EndOfStream,
+    ProcessPipelineError,
     create_task_group,
     fail_after,
     open_process,
+    open_process_pipeline,
     run_process,
+    sleep,
 )
 from anyio._core._eventloop import get_async_backend
 from anyio.streams.buffered import BufferedByteReceiveStream
@@ -493,3 +497,217 @@ async def test_close_with_stdout_blocked_subprocess(anyio_backend_name: str) -> 
             process._process._transport.close()  # type: ignore[attr-defined]
 
         pytest.fail("Process.aclose() deadlocked")
+
+
+def pipeline_command(script: str) -> list[str]:
+    return [sys.executable, "-c", dedent(script)]
+
+
+def assert_no_child_processes() -> None:
+    assert psutil.Process().children() == []
+
+
+async def test_pipeline_basic() -> None:
+    commands = [
+        pipeline_command("import sys; sys.stdout.write(sys.stdin.read()[::-1])"),
+        pipeline_command("import sys; sys.stdout.write(sys.stdin.read().upper())"),
+    ]
+    async with open_process_pipeline(commands) as pipeline:
+        assert len(pipeline.processes) == 2
+        assert pipeline.stdin is not None
+        assert pipeline.stdout is not None
+        await pipeline.stdin.send(b"hello")
+        await pipeline.stdin.aclose()
+        output = b""
+        async for chunk in pipeline.stdout:
+            output += chunk
+
+    assert output == b"OLLEH"
+    assert pipeline.returncodes == [0, 0]
+    assert pipeline.stderrs == [b"", b""]
+    assert_no_child_processes()
+
+
+@pytest.mark.parametrize(
+    "commands",
+    [
+        pytest.param([], id="empty"),
+        pytest.param([["echo", "hello"]], id="single"),
+    ],
+)
+async def test_pipeline_too_few_commands(commands: list[list[str]]) -> None:
+    with pytest.raises(ValueError, match="at least two commands"):
+        async with open_process_pipeline(commands):
+            pass
+
+
+async def test_pipeline_string_command_rejected() -> None:
+    commands = ["echo hello", "cat"]
+    with pytest.raises(TypeError, match="must be sequences of arguments"):
+        async with open_process_pipeline(commands):
+            pass
+
+
+async def test_pipeline_empty_command_rejected() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        async with open_process_pipeline([["echo"], []]):
+            pass
+
+
+async def test_pipeline_large_output() -> None:
+    """16 MiB of output must stream through the middle process without deadlocking."""
+    commands = [
+        pipeline_command(
+            """
+            import sys
+            chunk = b"x" * 65536
+            for _ in range(256):
+                sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            """
+        ),
+        pipeline_command(
+            "import shutil, sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"
+        ),
+    ]
+    with fail_after(15):
+        async with open_process_pipeline(commands) as pipeline:
+            assert pipeline.stdout is not None
+            received = 0
+            async for chunk in pipeline.stdout:
+                received += len(chunk)
+
+    assert received == 256 * 65536
+    assert pipeline.returncodes == [0, 0]
+    assert_no_child_processes()
+
+
+async def test_pipeline_streams_incrementally() -> None:
+    """Data must be passed on as it is read, not buffered until the producer exits."""
+    commands = [
+        pipeline_command(
+            """
+            import sys
+            import time
+            sys.stdout.buffer.write(b"x" * 65536)
+            sys.stdout.buffer.flush()
+            time.sleep(2)
+            """
+        ),
+        pipeline_command(
+            "import shutil, sys; shutil.copyfileobj(sys.stdin.buffer, sys.stdout.buffer)"
+        ),
+    ]
+    async with open_process_pipeline(commands, check=False) as pipeline:
+        assert pipeline.stdout is not None
+        with fail_after(1):
+            # The producer is still sleeping, so this can only arrive if the data
+            # is streamed through the pipeline instead of being buffered
+            chunk = await pipeline.stdout.receive()
+
+        assert chunk.startswith(b"x")
+
+    assert_no_child_processes()
+
+
+async def test_pipeline_stderr_captured_separately() -> None:
+    commands = [
+        pipeline_command("import sys; sys.stderr.write('error one\\n')"),
+        pipeline_command("import sys; sys.stderr.write('error two\\n')"),
+    ]
+    async with open_process_pipeline(commands) as pipeline:
+        pass
+
+    assert pipeline.stderrs == [b"error one\n", b"error two\n"]
+    assert_no_child_processes()
+
+
+async def test_pipeline_large_stderr_no_deadlock() -> None:
+    """A process flooding its stderr pipe must not deadlock the pipeline."""
+    command = pipeline_command("import sys; sys.stderr.buffer.write(b'e' * 2_000_000)")
+    with fail_after(15):
+        async with open_process_pipeline([command, command], check=False) as pipeline:
+            pass
+
+    assert pipeline.stderrs == [b"e" * 2_000_000] * 2
+    assert_no_child_processes()
+
+
+async def test_pipeline_early_exit() -> None:
+    """A process exiting early must not hang the rest of the pipeline."""
+    commands = [
+        pipeline_command(
+            """
+            import sys
+            chunk = b"x" * 65536
+            while True:
+                sys.stdout.buffer.write(chunk)
+            """
+        ),
+        pipeline_command("# exits immediately"),
+    ]
+    with fail_after(10):
+        async with open_process_pipeline(commands, check=False) as pipeline:
+            pass
+
+    assert pipeline.returncodes[1] == 0
+    assert pipeline.returncodes[0] != 0
+    assert_no_child_processes()
+
+
+async def test_pipeline_missing_middle_command() -> None:
+    """
+    If a command in the middle fails to start, the already started processes must be
+    killed and reaped.
+    """
+    commands = [
+        pipeline_command("import time; time.sleep(30)"),
+        ["nonexistent_command_anyio_test"],
+        pipeline_command("import sys; sys.stdin.read()"),
+    ]
+    # A nonexistent command raises FileNotFoundError, but some sandboxed
+    # environments report it as PermissionError instead
+    with pytest.raises((FileNotFoundError, PermissionError)):
+        async with open_process_pipeline(commands):
+            pass
+
+    assert_no_child_processes()
+
+
+async def test_pipeline_check() -> None:
+    """The raised error must contain the exit codes of all the stages."""
+    commands = [
+        pipeline_command("import sys; sys.exit(3)"),
+        pipeline_command("pass"),
+        pipeline_command("import sys; sys.stderr.write('oops'); sys.exit(5)"),
+    ]
+    with pytest.raises(ProcessPipelineError) as exc_info:
+        async with open_process_pipeline(commands):
+            pass
+
+    assert exc_info.value.returncodes == [3, 0, 5]
+    assert exc_info.value.stderrs[2] == b"oops"
+    assert "exited with code 3" in str(exc_info.value)
+    assert "exited with code 5" in str(exc_info.value)
+    assert_no_child_processes()
+
+
+async def test_pipeline_cancelled() -> None:
+    """Cancelling the enclosing task must kill and reap all the processes."""
+    command = pipeline_command("import time; time.sleep(30)")
+    with CancelScope() as scope:
+        async with open_process_pipeline([command, command], check=False):
+            scope.cancel()
+            await sleep(1)
+
+    assert_no_child_processes()
+
+
+async def test_pipeline_body_exception_kills_processes() -> None:
+    """An exception in the enclosed block must kill and reap all the processes."""
+    command = pipeline_command("import time; time.sleep(30)")
+    with pytest.raises(RuntimeError, match="boom"):
+        async with open_process_pipeline([command, command], check=False):
+            raise RuntimeError("boom")
+
+    assert_no_child_processes()

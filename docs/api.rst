@@ -187,8 +187,10 @@ Subprocesses
 
 .. autofunction:: anyio.run_process
 .. autofunction:: anyio.open_process
+.. autofunction:: anyio.open_process_pipeline
 
 .. autoclass:: anyio.abc.Process
+.. autoclass:: anyio.ProcessPipeline
 
 Synchronization
 ---------------
@@ -285,6 +287,7 @@ Exceptions
 .. autoexception:: anyio.FutureNotFinished
 .. autoexception:: anyio.IncompleteRead
 .. autoexception:: anyio.NoEventLoopError
+.. autoexception:: anyio.ProcessPipelineError
 .. autoexception:: anyio.RunFinishedError
 .. autoexception:: anyio.TaskFailed
 .. autoexception:: anyio.TaskCancelled

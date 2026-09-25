@@ -80,7 +80,10 @@ if TYPE_CHECKING or not install_lazy_importer():
     from ._core._streams import (
         create_memory_object_stream as create_memory_object_stream,
     )
+    from ._core._subprocesses import ProcessPipeline as ProcessPipeline
+    from ._core._subprocesses import ProcessPipelineError as ProcessPipelineError
     from ._core._subprocesses import open_process as open_process
+    from ._core._subprocesses import open_process_pipeline as open_process_pipeline
     from ._core._subprocesses import run_process as run_process
     from ._core._synchronization import CapacityLimiter as CapacityLimiter
     from ._core._synchronization import (

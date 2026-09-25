@@ -55,6 +55,39 @@ launch one with :func:`~open_process`::
 
 See the API documentation of :class:`~.abc.Process` for more information.
 
+Chaining processes into pipelines
+---------------------------------
+
+To connect several processes so that each one feeds its standard output to the next
+one (like the ``|`` operator in a shell, but without involving a shell), use
+:func:`~open_process_pipeline`::
+
+    from anyio import open_process_pipeline, run
+
+
+    async def main():
+        commands = [["gunzip", "data.txt.gz"], ["grep", "needle"]]
+        async with open_process_pipeline(commands) as pipeline:
+            async for chunk in pipeline.stdout:
+                print(chunk.decode(), end="")
+
+    run(main)
+
+The processes are connected directly with operating system pipes, so intermediate
+data streams from one process to the next without passing through the Python
+process. The standard error output of each process is captured separately and
+drained in the background, so a process flooding its stderr cannot deadlock the
+pipeline.
+
+The :class:`~ProcessPipeline` object yielded by the context manager gives you access
+to the individual processes along with the standard input of the first process and
+the standard output of the last one. When the context manager exits, all the
+processes are waited for, and if any of them exited with a non-zero exit code and
+``check`` is true (the default), :exc:`~ProcessPipelineError` is raised, containing
+the exit codes and captured stderr output of every stage. If a process fails to
+start, or the enclosed block raises an exception or is cancelled, all remaining
+processes are killed and reaped.
+
 .. _RunInProcess:
 
 Running functions in worker processes

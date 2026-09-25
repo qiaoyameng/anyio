@@ -5,6 +5,11 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``open_process_pipeline()`` async context manager which chains several
+  processes into a pipeline (like the ``|`` shell operator, but without a shell),
+  streaming data directly between processes, capturing stderr separately for each
+  process, and raising ``ProcessPipelineError`` with the exit codes of all the
+  stages when ``check`` is enabled
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
