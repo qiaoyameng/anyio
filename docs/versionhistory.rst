@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``checkpoint()`` method to ``BufferedByteReceiveStream`` which retains
+  bytes read from the stream so they can be rolled back, unless the checkpoint is
+  explicitly committed. Checkpoints can be nested, roll back automatically on
+  exceptions and cancellation, and support a configurable limit on retained bytes
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

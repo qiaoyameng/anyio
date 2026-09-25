@@ -179,6 +179,27 @@ The above script gives the following output::
 .. tip:: In some cases, you may need to inject data directly into the buffer. You can do
     that with the :meth:`~.streams.buffered.BufferedByteReceiveStream.feed_data` method.
 
+Checkpoints
+^^^^^^^^^^^
+
+When you need to speculatively read from the stream – for example, to sniff the
+protocol from the first few bytes before deciding how to parse the rest – you can use
+:meth:`~.streams.buffered.BufferedByteReceiveStream.checkpoint`. Bytes read inside the
+checkpoint block are retained in the buffer, and unless the checkpoint is explicitly
+committed, the read position is rolled back to where it was when the checkpoint was
+entered when the block exits (whether normally, via an exception or via cancellation)::
+
+    async with buffered.checkpoint(max_bytes=1024) as checkpoint:
+        header = await buffered.receive_exactly(4)
+        if header.startswith(b"\x89PNG"):
+            checkpoint.commit()  # keep reading from here; discard the history
+        # otherwise the block exits without a commit and the bytes can be re-read
+
+Checkpoints can be nested; committing an inner checkpoint does not discard any bytes
+still covered by an outer checkpoint. The ``max_bytes`` argument limits how many bytes
+will be retained for a potential rollback – if reading more data would exceed the
+limit, :exc:`BufferError` is raised before any unrecoverable data is consumed.
+
 Text streams
 ------------
 
