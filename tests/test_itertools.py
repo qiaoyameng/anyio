@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import (
     AsyncGenerator,
     AsyncIterable,
@@ -32,6 +33,7 @@ from anyio.itertools import (
     starmap,
     takewhile,
     tee,
+    zip,
     zip_longest,
 )
 from anyio.lowlevel import (
@@ -39,6 +41,9 @@ from anyio.lowlevel import (
     checkpoint,
     checkpoint_if_cancelled,
 )
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
 
 T = TypeVar("T")
 
@@ -985,6 +990,223 @@ class TestTee:
         iterator1, iterator2 = tee([1])
         assert await anext(iterator1) == 1
         await assert_cancelled_on_first_next(iterator2)
+
+
+class TestZip:
+    async def test_basic_cases(self) -> None:
+        cases = [
+            (zip([1, 2, 3], "abc"), [(1, "a"), (2, "b"), (3, "c")]),
+            (zip([1, 2, 3], "ab"), [(1, "a"), (2, "b")]),
+            (zip("ab", [1, 2, 3]), [("a", 1), ("b", 2)]),
+            (zip(aiter_from([1, 2]), aiter_from("ab")), [(1, "a"), (2, "b")]),
+            (zip([1, 2], aiter_from("ab")), [(1, "a"), (2, "b")]),
+            (zip(aiter_from("ab"), [1, 2]), [("a", 1), ("b", 2)]),
+            (zip([1, 2, 3]), [(1,), (2,), (3,)]),
+            (zip([], ()), []),
+            (zip(), []),
+        ]
+        for iterator, expected in cases:
+            assert await collect(iterator) == expected
+
+    async def test_checkpoints_empty_results(self) -> None:
+        for iterator in (zip([], ()), zip()):
+            await assert_cancelled_on_first_next(iterator)
+
+        for iterator in (zip([], ()), zip()):
+            await assert_checkpoints_on_first_next(iterator)
+
+    async def test_strict_equal_lengths(self) -> None:
+        assert await collect(zip([1, 2], aiter_from("ab"), strict=True)) == [
+            (1, "a"),
+            (2, "b"),
+        ]
+        assert await collect(zip([], (), strict=True)) == []
+        assert await collect(zip(strict=True)) == []
+
+    @pytest.mark.parametrize(
+        "iterables, match",
+        [
+            pytest.param(
+                ([1], [10, 20]),
+                r"zip\(\) argument 2 is longer than argument 1",
+                id="second-longer",
+            ),
+            pytest.param(
+                ([1], [10], "abc"),
+                r"zip\(\) argument 3 is longer than argument 1",
+                id="third-longer",
+            ),
+            pytest.param(
+                ([1, 2], [10]),
+                r"zip\(\) argument 2 is shorter than argument 1",
+                id="second-shorter",
+            ),
+            pytest.param(
+                ([1, 2], [10, 20], [100]),
+                r"zip\(\) argument 3 is shorter than arguments 1-2",
+                id="third-shorter",
+            ),
+        ],
+    )
+    async def test_strict_unequal_lengths(
+        self, iterables: tuple[Iterable[Any], ...], match: str
+    ) -> None:
+        with pytest.raises(ValueError, match=match):
+            await collect(zip(*iterables, strict=True))
+
+    async def test_strict_unequal_lengths_async_iterables(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"zip\(\) argument 2 is longer than argument 1"
+        ):
+            await collect(zip(aiter_from([1]), aiter_from([10, 20]), strict=True))
+
+    async def test_pulls_at_most_one_item_per_iterator_per_round(self) -> None:
+        pulls = {"infinite": 0, "finite": 0}
+
+        def infinite() -> Iterator[int]:
+            number = 0
+            while True:
+                pulls["infinite"] += 1
+                yield number
+                number += 1
+
+        def finite() -> Iterator[int]:
+            for number in range(2):
+                pulls["finite"] += 1
+                yield number
+
+        assert await collect(zip(infinite(), finite())) == [(0, 0), (1, 1)]
+        assert pulls == {"infinite": 3, "finite": 2}
+
+        pulls = {"infinite": 0, "finite": 0}
+        assert await collect(zip(finite(), infinite())) == [(0, 0), (1, 1)]
+        assert pulls == {"infinite": 2, "finite": 2}
+
+    async def test_same_iterator_passed_multiple_times(self) -> None:
+        pulls = 0
+
+        def gen() -> Iterator[int]:
+            nonlocal pulls
+            for number in range(5):
+                pulls += 1
+                yield number
+
+        iterator = gen()
+        assert await collect(zip(iterator, iterator)) == [(0, 1), (2, 3)]
+        assert pulls == 5
+
+    async def test_same_async_iterator_passed_multiple_times(self) -> None:
+        iterator = aiter_from(range(5))
+        assert await collect(zip(iterator, iterator)) == [(0, 1), (2, 3)]
+
+    async def test_iterators_closed_on_iterator_error(self) -> None:
+        closed: list[str] = []
+
+        async def async_gen() -> AsyncGenerator[int, None]:
+            try:
+                yield 1
+                yield 2
+            finally:
+                closed.append("async")
+
+        def sync_gen() -> Iterator[int]:
+            try:
+                yield 10
+                yield 20
+            finally:
+                closed.append("sync")
+
+        async def failing() -> AsyncGenerator[int, None]:
+            yield 100
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await collect(zip(async_gen(), sync_gen(), failing()))
+
+        assert sorted(closed) == ["async", "sync"]
+
+    async def test_iterators_closed_on_cancellation(self) -> None:
+        closed = False
+
+        async def cancellable() -> AsyncGenerator[int, None]:
+            number = 0
+            while True:
+                await checkpoint()
+                yield number
+                number += 1
+
+        async def watched() -> AsyncGenerator[int, None]:
+            nonlocal closed
+            try:
+                yield 10
+                yield 20
+            finally:
+                closed = True
+
+        with CancelScope() as scope:
+            iterator = zip(cancellable(), watched())
+            assert await anext(iterator) == (0, 10)
+            scope.cancel()
+            with pytest.raises(get_cancelled_exc_class()):
+                await anext(iterator)
+
+        assert closed
+
+    async def test_iterators_closed_on_aclose(self) -> None:
+        closed = False
+
+        async def async_gen() -> AsyncGenerator[int, None]:
+            nonlocal closed
+            try:
+                yield 1
+                yield 2
+            finally:
+                closed = True
+
+        iterator = zip(async_gen())
+        assert await anext(iterator) == (1,)
+        await iterator.aclose()
+        assert closed
+
+    async def test_single_cleanup_exception_chained_to_original_error(self) -> None:
+        class FailingClose(AsyncIterator[int]):
+            async def __anext__(self) -> int:
+                await checkpoint()
+                return 1
+
+            async def aclose(self) -> None:
+                raise ValueError("close failed")
+
+        async def failing() -> AsyncGenerator[int, None]:
+            yield 1
+            raise RuntimeError("original error")
+
+        with pytest.raises(ValueError, match="close failed") as exc_info:
+            await collect(zip(FailingClose(), failing()))
+
+        assert isinstance(exc_info.value.__context__, RuntimeError)
+
+    async def test_multiple_cleanup_exceptions_chained_to_original_error(
+        self,
+    ) -> None:
+        class FailingClose(AsyncIterator[int]):
+            async def __anext__(self) -> int:
+                await checkpoint()
+                return 1
+
+            async def aclose(self) -> None:
+                raise ValueError("close failed")
+
+        async def failing() -> AsyncGenerator[int, None]:
+            yield 1
+            raise RuntimeError("original error")
+
+        with pytest.raises(ExceptionGroup) as exc_info:
+            await collect(zip(FailingClose(), FailingClose(), failing()))
+
+        assert isinstance(exc_info.value.__context__, RuntimeError)
+        assert len(exc_info.value.exceptions) == 2
+        assert all(isinstance(exc, ValueError) for exc in exc_info.value.exceptions)
 
 
 class TestZipLongest:

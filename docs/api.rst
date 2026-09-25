@@ -246,6 +246,7 @@ Asynchronous itertools
 .. autofunction:: anyio.itertools.starmap
 .. autofunction:: anyio.itertools.tee
 .. autofunction:: anyio.itertools.takewhile
+.. autofunction:: anyio.itertools.zip
 .. autofunction:: anyio.itertools.zip_longest
 
 Low level operations

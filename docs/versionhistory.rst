@@ -5,6 +5,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``anyio.itertools.zip()`` function, an asynchronous variant of
+  ``zip()`` that accepts both synchronous and asynchronous iterables and supports
+  the ``strict`` keyword argument
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

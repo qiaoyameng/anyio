@@ -20,6 +20,7 @@ __all__ = (
     "starmap",
     "takewhile",
     "tee",
+    "zip",
     "zip_longest",
 )
 
@@ -45,6 +46,9 @@ from .lowlevel import cancel_shielded_checkpoint, checkpoint, checkpoint_if_canc
 if sys.version_info < (3, 15):
     from typing_extensions import sentinel
 
+if sys.version_info < (3, 11):
+    from exceptiongroup import ExceptionGroup
+
 T = TypeVar("T")
 R = TypeVar("R")
 _tee_end = sentinel("_tee_end")
@@ -64,6 +68,11 @@ class _IterableAsyncIterator(AsyncIterator[T]):
 
         await cancel_shielded_checkpoint()
         return result
+
+    async def aclose(self) -> None:
+        close = getattr(self.iterator, "close", None)
+        if close is not None:
+            close()
 
 
 def _iterate(iterable: Iterable[T] | AsyncIterable[T]) -> AsyncIterator[T]:
@@ -588,6 +597,80 @@ async def takewhile(
 
     if not element_yielded:
         await checkpoint()
+
+
+async def zip(
+    *iterables: Iterable[object] | AsyncIterable[object], strict: bool = False
+) -> AsyncGenerator[tuple[object, ...], None]:
+    iterators = [_iterate(iterable) for iterable in iterables]
+    if not iterators:
+        await checkpoint()
+        return
+
+    tuple_yielded = False
+    try:
+        while True:
+            values: list[object] = []
+            for index, iterator in enumerate(iterators):
+                try:
+                    value = await anext(iterator)
+                except StopAsyncIteration:
+                    if strict:
+                        if index == 1:
+                            raise ValueError(
+                                "zip() argument 2 is shorter than argument 1"
+                            ) from None
+                        if index > 1:
+                            raise ValueError(
+                                f"zip() argument {index + 1} is shorter than "
+                                f"arguments 1-{index}"
+                            ) from None
+
+                        for other_index in range(index + 1, len(iterators)):
+                            try:
+                                await anext(iterators[other_index])
+                            except StopAsyncIteration:
+                                continue
+
+                            raise ValueError(
+                                f"zip() argument {other_index + 1} is longer than "
+                                f"argument {index + 1}"
+                            ) from None
+
+                    if not tuple_yielded:
+                        await checkpoint()
+
+                    return
+
+                values.append(value)
+
+            tuple_yielded = True
+            yield tuple(values)
+    finally:
+        errors: list[Exception] = []
+        closed_iterator_ids: set[int] = set()
+        with CancelScope(shield=True):
+            for iterator in iterators:
+                if id(iterator) in closed_iterator_ids:
+                    continue
+
+                closed_iterator_ids.add(id(iterator))
+                aclose = getattr(iterator, "aclose", None)
+                if aclose is None:
+                    continue
+
+                try:
+                    await aclose()
+                except Exception as exc:
+                    errors.append(exc)
+
+        if errors:
+            if len(errors) == 1:
+                raise errors[0]
+
+            raise ExceptionGroup(
+                "multiple exceptions raised while closing iterators", errors
+            )
 
 
 async def zip_longest(
