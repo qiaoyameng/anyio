@@ -14,7 +14,7 @@ import sys
 from collections import deque
 from collections.abc import Callable
 from types import ModuleType
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from ._core._eventloop import current_time, get_async_backend, get_cancelled_exc_class
 from ._core._exceptions import BrokenWorkerProcess
@@ -34,11 +34,15 @@ WORKER_MAX_IDLE_TIME = 300  # 5 minutes
 
 T_Retval = TypeVar("T_Retval")
 PosArgsT = TypeVarTuple("PosArgsT")
+InitArgsT = TypeVarTuple("InitArgsT")
 
 _process_pool_workers: RunVar[set[Process]] = RunVar("_process_pool_workers")
-_process_pool_idle_workers: RunVar[deque[tuple[Process, float]]] = RunVar(
-    "_process_pool_idle_workers"
-)
+_process_pool_idle_workers: RunVar[
+    dict[
+        tuple[Callable[..., Any] | None, tuple[Any, ...]],
+        deque[tuple[Process, float]],
+    ]
+] = RunVar("_process_pool_idle_workers")
 _default_process_limiter: RunVar[CapacityLimiter] = RunVar("_default_process_limiter")
 
 
@@ -47,6 +51,8 @@ async def run_sync(  # type: ignore[return]
     *args: Unpack[PosArgsT],
     cancellable: bool = False,
     limiter: CapacityLimiter | None = None,
+    initializer: Callable[[Unpack[InitArgsT]], Any] | None = None,
+    initargs: tuple[Unpack[InitArgsT]] = (),
 ) -> T_Retval:
     """
     Call the given function with the given arguments in a worker process.
@@ -55,12 +61,22 @@ async def run_sync(  # type: ignore[return]
     cancelled, the worker process running it will be abruptly terminated using SIGKILL
     (or ``terminateProcess()`` on Windows).
 
+    If an initializer is given, it is called with ``initargs`` in each new worker
+    process before it starts processing requests. This is useful for one-time setup
+    such as loading a large data structure into memory. Worker processes are only
+    shared between calls whose initializer and initargs are equal, so both must be
+    hashable. If the initializer raises an exception, it is propagated to the caller
+    and the worker process is discarded.
+
     :param func: a callable
     :param args: positional arguments for the callable
     :param cancellable: ``True`` to allow cancellation of the operation while it's
         running
     :param limiter: capacity limiter to use to limit the total amount of processes
         running (if omitted, the default limiter is used)
+    :param initializer: a callable to run in each new worker process before it
+        processes any requests
+    :param initargs: positional arguments to pass to the initializer
     :raises NoEventLoopError: if no supported asynchronous event loop is running in the
         current thread
     :return: an awaitable that yields the return value of the function.
@@ -102,6 +118,23 @@ async def run_sync(  # type: ignore[return]
     # First pickle the request before trying to reserve a worker process
     await checkpoint_if_cancelled()
     request = pickle.dumps(("run", func, args), protocol=pickle.HIGHEST_PROTOCOL)
+    if initializer is not None:
+        init_request: bytes | None = pickle.dumps(
+            ("run", initializer, initargs), protocol=pickle.HIGHEST_PROTOCOL
+        )
+    else:
+        init_request = None
+
+    # The initializer and its arguments determine which pool of worker processes can
+    # serve this call, so they must be usable as a dictionary key
+    pool_key: tuple[Callable[..., Any] | None, tuple[Any, ...]] = (
+        initializer,
+        initargs,
+    )
+    try:
+        hash(pool_key)
+    except TypeError:
+        raise TypeError("the initializer and its arguments must be hashable") from None
 
     # If this is the first run in this event loop thread, set up the necessary variables
     try:
@@ -109,7 +142,7 @@ async def run_sync(  # type: ignore[return]
         idle_workers = _process_pool_idle_workers.get()
     except LookupError:
         workers = set()
-        idle_workers = deque()
+        idle_workers = {}
         _process_pool_workers.set(workers)
         _process_pool_idle_workers.set(idle_workers)
         get_async_backend().setup_process_pool_exit_at_shutdown(workers)
@@ -117,9 +150,10 @@ async def run_sync(  # type: ignore[return]
     async with limiter or current_default_process_limiter():
         # Pop processes from the pool (starting from the most recently used) until we
         # find one that hasn't exited yet
+        idle_worker_queue = idle_workers.setdefault(pool_key, deque())
         process: Process
-        while idle_workers:
-            process, _idle_since = idle_workers.pop()
+        while idle_worker_queue:
+            process, _idle_since = idle_worker_queue.pop()
             if process.returncode is None:
                 stdin = cast(ByteSendStream, process.stdin)
                 buffered = BufferedByteReceiveStream(
@@ -130,14 +164,15 @@ async def run_sync(  # type: ignore[return]
                 # seconds or longer
                 now = current_time()
                 killed_processes: list[Process] = []
-                while idle_workers:
-                    if now - idle_workers[0][1] < WORKER_MAX_IDLE_TIME:
-                        break
+                for queue in idle_workers.values():
+                    while queue:
+                        if now - queue[0][1] < WORKER_MAX_IDLE_TIME:
+                            break
 
-                    process_to_kill, _idle_since = idle_workers.popleft()
-                    process_to_kill.kill()
-                    workers.remove(process_to_kill)
-                    killed_processes.append(process_to_kill)
+                        process_to_kill, _idle_since = queue.popleft()
+                        process_to_kill.kill()
+                        workers.remove(process_to_kill)
+                        killed_processes.append(process_to_kill)
 
                 with CancelScope(shield=True):
                     for killed_process in killed_processes:
@@ -178,6 +213,23 @@ async def run_sync(  # type: ignore[return]
                     "Error during worker process initialization"
                 ) from exc
 
+            if init_request is not None:
+                try:
+                    await send_raw_command(init_request)
+                except BaseException:
+                    # A worker whose initializer failed (or was interrupted) must
+                    # not be reused, so kill it and let the exception propagate to
+                    # the caller
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+
+                    with CancelScope(shield=True):
+                        await process.aclose()
+
+                    raise
+
             workers.add(process)
 
         with CancelScope(shield=not cancellable):
@@ -185,7 +237,7 @@ async def run_sync(  # type: ignore[return]
                 return cast(T_Retval, await send_raw_command(request))
             finally:
                 if process in workers:
-                    idle_workers.append((process, current_time()))
+                    idle_worker_queue.append((process, current_time()))
 
 
 def current_default_process_limiter() -> CapacityLimiter:

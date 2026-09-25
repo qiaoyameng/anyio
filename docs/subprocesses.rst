@@ -93,6 +93,30 @@ This is done by using :func:`.to_process.run_sync`::
     if __name__ == '__main__':
         run(main)
 
+Initializing worker processes
+*****************************
+
+If your worker functions need access to something that is expensive to set up, such
+as a large data structure loaded into memory, you can pass an initializer function
+via the ``initializer`` and ``initargs`` arguments to :func:`.to_process.run_sync`.
+The initializer is run once in each worker process, before it starts processing
+requests::
+
+    def load_dictionary(path):
+        global dictionary
+        with open(path) as f:
+            dictionary = set(f.read().splitlines())
+
+    async def main():
+        await to_process.run_sync(
+            cpu_intensive_function, 'Hello, ', 'world!',
+            initializer=load_dictionary, initargs=('/path/to/dictionary',),
+        )
+
+Worker processes are only shared between calls whose initializer and initargs are
+equal, so both must be hashable. If the initializer raises an exception, it is
+propagated to the caller and the worker process is discarded.
+
 Technical details
 *****************
 

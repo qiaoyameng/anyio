@@ -14,6 +14,7 @@ from anyio import (
     CancelScope,
     create_task_group,
     fail_after,
+    sleep,
     to_process,
     wait_all_tasks_blocked,
 )
@@ -122,20 +123,21 @@ async def test_exec_while_pruning() -> None:
     worker_pid1 = await to_process.run_sync(os.getpid)
     workers = to_process._process_pool_workers.get()
     idle_workers = to_process._process_pool_idle_workers.get()
+    idle_worker_queue = idle_workers[None, ()]
     real_worker = next(iter(workers))
 
     fake_idle_process = Mock(Process)
     workers.add(fake_idle_process)
     try:
         # Add a mock worker process that's guaranteed to be eligible for pruning
-        idle_workers.appendleft(
+        idle_worker_queue.appendleft(
             (fake_idle_process, -to_process.WORKER_MAX_IDLE_TIME - 1)
         )
 
         worker_pid2 = await to_process.run_sync(os.getpid)
         assert worker_pid1 == worker_pid2
         fake_idle_process.kill.assert_called_once_with()
-        assert idle_workers[0][0] is real_worker
+        assert idle_worker_queue[0][0] is real_worker
     finally:
         workers.discard(fake_idle_process)
 
@@ -173,3 +175,124 @@ async def test_entrypoint_main_module(monkeypatch: MonkeyPatch, tmp_path: Path) 
     script_path.write_text("foo=3")
     monkeypatch.setattr("__main__.__file__", str(script_path))
     assert await to_process.run_sync(_check_main_importable) == 3
+
+
+_initializer_call_count = 0
+_init_value = 0
+
+
+def _counting_initializer() -> None:
+    global _initializer_call_count
+    _initializer_call_count += 1
+
+
+def _get_initializer_call_count() -> tuple[int, int]:
+    return os.getpid(), _initializer_call_count
+
+
+async def test_initializer() -> None:
+    """
+    Test that the initializer is run exactly once in the worker process, and that
+    subsequent calls with the same initializer reuse that worker process.
+    """
+    worker_pid, init_count = await to_process.run_sync(
+        _get_initializer_call_count, initializer=_counting_initializer
+    )
+    assert worker_pid != os.getpid()
+    assert init_count == 1
+    assert await to_process.run_sync(
+        _get_initializer_call_count, initializer=_counting_initializer
+    ) == (worker_pid, 1)
+
+    # Calls without an initializer must not reuse the initialized worker
+    assert await to_process.run_sync(os.getpid) != worker_pid
+
+
+def _value_initializer(value: int) -> None:
+    global _init_value
+    _init_value = value
+
+
+def _get_init_value() -> tuple[int, int]:
+    return os.getpid(), _init_value
+
+
+async def test_initializer_initargs() -> None:
+    """
+    Test that calls with different initargs use separate worker processes, and that
+    interleaved calls each reuse their own initialized worker process.
+    """
+    pid1, value1 = await to_process.run_sync(
+        _get_init_value, initializer=_value_initializer, initargs=(1,)
+    )
+    pid2, value2 = await to_process.run_sync(
+        _get_init_value, initializer=_value_initializer, initargs=(2,)
+    )
+    assert (value1, value2) == (1, 2)
+    assert pid1 != pid2
+
+    # Interleave calls to both configurations; each must reuse its own worker
+    assert await to_process.run_sync(
+        _get_init_value, initializer=_value_initializer, initargs=(1,)
+    ) == (pid1, 1)
+    assert await to_process.run_sync(
+        _get_init_value, initializer=_value_initializer, initargs=(2,)
+    ) == (pid2, 2)
+
+
+def _failing_initializer() -> None:
+    raise ValueError("initializer failed")
+
+
+async def test_initializer_exception() -> None:
+    """
+    Test that an exception raised by the initializer is propagated to the caller,
+    and that the failed worker process is discarded instead of being pooled.
+    """
+    for _ in range(2):
+        with pytest.raises(ValueError, match="initializer failed"):
+            await to_process.run_sync(os.getpid, initializer=_failing_initializer)
+
+        # The failed worker must not have been pooled, and no replacement worker
+        # must have been spawned to take its place
+        assert not to_process._process_pool_workers.get()
+        idle_workers = to_process._process_pool_idle_workers.get()
+        assert not idle_workers.get((_failing_initializer, ()))
+
+
+async def test_unhashable_initargs() -> None:
+    """Test that unhashable initializer arguments are rejected with a TypeError."""
+    with pytest.raises(TypeError, match="must be hashable"):
+        await to_process.run_sync(
+            os.getpid,
+            initializer=_value_initializer,
+            initargs=([],),  # type: ignore[arg-type]
+        )
+
+
+def _slow_initializer() -> None:
+    time.sleep(5)
+
+
+async def test_cancel_during_initializer() -> None:
+    """
+    Test that cancelling the first call while its initializer is still running does
+    not leave a half-initialized worker process in the pool.
+    """
+    with fail_after(10):
+        async with create_task_group() as tg:
+            tg.start_soon(
+                partial(to_process.run_sync, initializer=_slow_initializer),
+                os.getpid,
+            )
+            await wait_all_tasks_blocked()
+            await sleep(0.5)
+            tg.cancel_scope.cancel()
+
+    # The half-initialized worker must have been killed instead of pooled
+    assert not to_process._process_pool_workers.get()
+    idle_workers = to_process._process_pool_idle_workers.get()
+    assert not idle_workers.get((_slow_initializer, ()))
+
+    # The pool must still be usable afterwards
+    assert await to_process.run_sync(os.getpid) != os.getpid()
