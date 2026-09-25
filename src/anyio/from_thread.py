@@ -31,12 +31,13 @@ from typing import (
     overload,
 )
 
+from . import to_thread
 from ._core._eventloop import (
     get_cancelled_exc_class,
     threadlocals,
 )
 from ._core._eventloop import run as run_eventloop
-from ._core._exceptions import NoEventLoopError
+from ._core._exceptions import NoEventLoopError, RunFinishedError
 from ._core._synchronization import Event
 from ._core._tasks import CancelScope, create_task_group
 from .abc._tasks import TaskStatus
@@ -338,6 +339,87 @@ class BlockingPortal:
 
         """
         return cast(T_Retval, self.start_task_soon(func, *args).result())
+
+    @overload
+    async def call_async(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Awaitable[T_Retval]],
+        *args: Unpack[PosArgsT],
+    ) -> T_Retval: ...
+
+    @overload
+    async def call_async(
+        self, func: Callable[[Unpack[PosArgsT]], T_Retval], *args: Unpack[PosArgsT]
+    ) -> T_Retval: ...
+
+    async def call_async(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Awaitable[T_Retval] | T_Retval],
+        *args: Unpack[PosArgsT],
+    ) -> T_Retval:
+        """
+        Call the given function in the event loop thread and await the result.
+
+        This is the asynchronous counterpart to :meth:`call`, meant to be called from
+        a task running in a different event loop (in another thread) than the one the
+        portal is running in. Unlike :meth:`call`, this method does not block the
+        calling thread, so other tasks in the calling event loop remain schedulable
+        while the call is in progress.
+
+        If the callable returns a coroutine object, it is awaited on.
+
+        The context variables of the calling task are propagated to the callable, but
+        any changes made to them by the callable are not propagated back.
+
+        If the call is cancelled from the calling side, the cancellation is forwarded
+        to the task running the callable in the portal's event loop, without affecting
+        the portal itself or any other calls.
+
+        :param func: any callable
+        :raises RuntimeError: if the portal is not running or if this method is called
+            from within the portal's own event loop thread
+
+        .. versionadded:: 4.16.0
+
+        """
+        self._check_running()
+        token = current_token()
+        caller_thread_id = get_ident()
+        event = Event()
+
+        def on_done(f: Future[T_Retval]) -> None:
+            if get_ident() == caller_thread_id:
+                # The future was completed or cancelled from the calling thread, so
+                # the event can be set directly
+                event.set()
+            else:
+                try:
+                    run_sync(event.set, token=token)
+                except RunFinishedError:
+                    # The calling event loop is no longer running
+                    pass
+
+        # Submit the task from a worker thread, as start_task_soon() blocks the
+        # calling thread until the portal's event loop has scheduled the task, which
+        # must not happen on the caller's own event loop thread
+        def submit() -> Future[T_Retval]:
+            return self.start_task_soon(func, *args)
+
+        with CancelScope(shield=True):
+            future = await to_thread.run_sync(submit)
+
+        future.add_done_callback(on_done)
+        try:
+            await event.wait()
+        except get_cancelled_exc_class():
+            # Forward the cancellation to the task in the portal, but don't block
+            # the calling event loop while doing so
+            with CancelScope(shield=True):
+                await to_thread.run_sync(future.cancel)
+
+            raise
+
+        return future.result()
 
     @overload
     def start_task_soon(

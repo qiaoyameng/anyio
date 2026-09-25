@@ -812,3 +812,195 @@ class TestBlockingPortal:
                 # Ensure thread has time to start the task
                 await event.wait()
                 await portal.stop(cancel_remaining=True)
+
+
+@pytest.mark.usefixtures("deactivate_blockbuster")
+class TestBlockingPortalCallAsync:
+    """
+    Tests for BlockingPortal.call_async(), where the caller is a task running in
+    another event loop in a different thread.
+    """
+
+    @pytest.fixture(
+        params=[
+            *asyncio_params,
+            pytest.param(
+                ("trio", {}),
+                marks=pytest.mark.skipif(
+                    "trio" not in get_available_backends(),
+                    reason="trio is not available",
+                ),
+                id="trio",
+            ),
+        ]
+    )
+    def portal_backend(self, request: Any) -> tuple[str, dict[str, Any]]:
+        return request.param
+
+    async def test_call_async_corofunc(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        async def async_add_in_thread(a: int, b: int) -> int:
+            assert threading.current_thread() is not threading.main_thread()
+            return a + b
+
+        with start_blocking_portal(*portal_backend) as portal:
+            assert await portal.call_async(async_add_in_thread, 1, 2) == 3
+
+    async def test_call_async_non_corofunc(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        async def async_add_in_thread(a: int, b: int) -> int:
+            assert threading.current_thread() is not threading.main_thread()
+            return a + b
+
+        with start_blocking_portal(*portal_backend) as portal:
+            result = await portal.call_async(
+                return_non_coro_awaitable(async_add_in_thread), 1, 2
+            )
+            assert result == 3
+
+    async def test_call_async_exception(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        async def fail() -> NoReturn:
+            raise Exception("foo")
+
+        with start_blocking_portal(*portal_backend) as portal:
+            with pytest.raises(Exception, match="foo"):
+                await portal.call_async(fail)
+
+    async def test_call_async_does_not_block_event_loop(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        """Test that other tasks in the calling event loop run while awaiting."""
+        flag = threading.Event()
+
+        async def wait_for_flag() -> str:
+            while not flag.is_set():
+                await sleep(0.01)
+
+            return "done"
+
+        async def set_flag() -> None:
+            await sleep(0.05)
+            flag.set()
+
+        with start_blocking_portal(*portal_backend) as portal:
+            # If call_async() blocked the calling event loop, set_flag() would
+            # never run and this would time out
+            with fail_after(10):
+                async with create_task_group() as tg:
+                    tg.start_soon(set_flag)
+                    assert await portal.call_async(wait_for_flag) == "done"
+
+    async def test_call_async_cancellation(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        """
+        Test that cancelling the awaiting task cancels the call in the portal,
+        without affecting the portal itself or other concurrent calls.
+        """
+        token = current_token()
+        started = Event()
+        target_cancelled = threading.Event()
+        other_results: list[int] = []
+
+        async def cancellable() -> None:
+            from_thread.run_sync(started.set, token=token)
+            try:
+                await sleep(30)
+            except get_cancelled_exc_class():
+                target_cancelled.set()
+                raise
+
+        async def slow_add(a: int, b: int) -> int:
+            await sleep(0.2)
+            return a + b
+
+        async def cancel_when_started() -> None:
+            await started.wait()
+            scope.cancel()
+
+        async def other_call() -> None:
+            other_results.append(await portal.call_async(slow_add, 1, 2))
+
+        with start_blocking_portal(*portal_backend) as portal:
+            async with create_task_group() as tg:
+                tg.start_soon(other_call)
+                with CancelScope() as scope:
+                    tg.start_soon(cancel_when_started)
+                    with pytest.raises(get_cancelled_exc_class()):
+                        await portal.call_async(cancellable)
+
+            # The cancellation must have been delivered to the target callable
+            with fail_after(10):
+                while not target_cancelled.is_set():
+                    await sleep(0.01)
+
+            # The concurrent call completed normally and the portal is still usable
+            assert other_results == [3]
+            assert await portal.call_async(slow_add, 3, 4) == 7
+
+    async def test_call_async_contextvar_propagation(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        """
+        Test that context variables propagate to the callable, but changes made by
+        the callable are not propagated back.
+        """
+        var: ContextVar[str] = ContextVar("var")
+        var.set("caller")
+
+        async def read_and_modify() -> str:
+            value = var.get()
+            var.set("target")
+            return value
+
+        with start_blocking_portal(*portal_backend) as portal:
+            assert await portal.call_async(read_and_modify) == "caller"
+
+        assert var.get() == "caller"
+
+    async def test_call_async_stopped_portal(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        with start_blocking_portal(*portal_backend) as portal:
+            pass
+
+        with pytest.raises(RuntimeError, match="This portal is not running"):
+            await portal.call_async(async_add, 1, 2)
+
+    async def test_call_async_portal_stopped_during_call(
+        self, portal_backend: tuple[str, dict[str, Any]]
+    ) -> None:
+        """Test that a call in flight is cancelled when the portal is stopped."""
+        results: list[BaseException] = []
+        started = threading.Event()
+
+        async def target() -> None:
+            started.set()
+            await sleep(30)
+
+        async def caller(portal: BlockingPortal) -> None:
+            try:
+                await portal.call_async(target)
+            except BaseException as exc:
+                results.append(exc)
+
+        with start_blocking_portal(*portal_backend) as portal:
+            async with create_task_group() as tg:
+                tg.start_soon(caller, portal)
+                assert await to_thread.run_sync(started.wait, 10)
+                await to_thread.run_sync(portal.call, portal.stop, True)
+
+        assert len(results) == 1
+        assert isinstance(results[0], futures.CancelledError)
+
+    async def test_call_async_from_event_loop_thread(self) -> None:
+        async with BlockingPortal() as portal:
+            with pytest.raises(
+                RuntimeError,
+                match="This method cannot be called from the event loop thread",
+            ):
+                await portal.call_async(async_add, 1, 2)

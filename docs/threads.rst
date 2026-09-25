@@ -220,6 +220,38 @@ to signal readiness by calling ``task_status.started()``::
         print('Task has finished with return value', return_value)
 
 
+Calling the portal from asynchronous code
++++++++++++++++++++++++++++++++++++++++++
+
+When the caller is itself a task running in another event loop (in a different
+thread), blocking that event loop with :meth:`~.BlockingPortal.call` would prevent it
+from scheduling other tasks. For such cases,
+:meth:`~.BlockingPortal.call_async` provides an awaitable alternative::
+
+    from anyio import run
+    from anyio.from_thread import start_blocking_portal
+
+
+    async def async_func() -> None:
+        print("This runs in the portal's event loop thread")
+
+
+    async def main() -> None:
+        with start_blocking_portal() as portal:
+            # The portal runs its event loop in another thread, while this event
+            # loop remains free to schedule other tasks during the call
+            await portal.call_async(async_func)
+
+
+    run(main)
+
+
+While the call is in progress, the calling event loop remains free to run other
+tasks. Cancelling the awaiting task forwards the cancellation to the callable running
+in the portal, without shutting down the portal or affecting any other calls. Context
+variables are propagated to the callable, but changes made to them on the portal side
+are not propagated back.
+
 Using asynchronous context managers
 +++++++++++++++++++++++++++++++++++
 
