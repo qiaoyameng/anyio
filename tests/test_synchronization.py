@@ -14,6 +14,7 @@ from anyio import (
     Event,
     Lock,
     Semaphore,
+    WeightedCapacityLimiter,
     WouldBlock,
     create_task_group,
     fail_after,
@@ -1061,3 +1062,322 @@ class TestCapacityLimiter:
         assert limiter.available_tokens >= 0
         assert limiter.statistics().borrowers == ("B",)
         limiter.release_on_behalf_of("B")
+
+
+class TestWeightedCapacityLimiter:
+    async def test_bad_init_type(self) -> None:
+        pytest.raises(TypeError, WeightedCapacityLimiter, 1.0).match(
+            "total_tokens must be an integer"
+        )
+
+    async def test_bad_init_value(self) -> None:
+        pytest.raises(ValueError, WeightedCapacityLimiter, -1).match(
+            "total_tokens must be >= 0"
+        )
+
+    async def test_bad_total_tokens_type(self) -> None:
+        limiter = WeightedCapacityLimiter(1)
+        with pytest.raises(TypeError, match="total_tokens must be an integer"):
+            limiter.total_tokens = 2.0  # type: ignore[assignment]
+
+    async def test_bad_total_tokens_value(self) -> None:
+        limiter = WeightedCapacityLimiter(1)
+        with pytest.raises(ValueError, match="total_tokens must be >= 0"):
+            limiter.total_tokens = -1
+
+    @pytest.mark.parametrize("weight", [1.5, "1"])
+    async def test_bad_weight_type(self, weight: Any) -> None:
+        limiter = WeightedCapacityLimiter(2)
+        with pytest.raises(TypeError, match="weight must be an integer"):
+            limiter.acquire_nowait(weight)
+
+        with pytest.raises(TypeError, match="weight must be an integer"):
+            await limiter.acquire(weight)
+
+    @pytest.mark.parametrize("weight", [0, -1])
+    async def test_bad_weight_value(self, weight: int) -> None:
+        limiter = WeightedCapacityLimiter(2)
+        with pytest.raises(ValueError, match="weight must be >= 1"):
+            limiter.acquire_nowait(weight)
+
+        with pytest.raises(ValueError, match="weight must be >= 1"):
+            await limiter.acquire(weight)
+
+    async def test_zero_tokens(self) -> None:
+        limiter = WeightedCapacityLimiter(0)
+        assert limiter.total_tokens == 0
+        assert limiter.available_tokens == 0
+        async with create_task_group() as tg:
+            tg.start_soon(limiter.acquire)
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_waiting == 1
+            limiter.total_tokens = 1
+            await wait_all_tasks_blocked()
+            assert limiter.borrowed_tokens == 1
+            tg.cancel_scope.cancel()
+
+    async def test_borrow(self) -> None:
+        limiter = WeightedCapacityLimiter(4)
+        assert limiter.total_tokens == 4
+        assert limiter.available_tokens == 4
+        assert limiter.borrowed_tokens == 0
+        async with limiter:
+            assert limiter.total_tokens == 4
+            assert limiter.available_tokens == 3
+            assert limiter.borrowed_tokens == 1
+
+        assert limiter.borrowed_tokens == 0
+        assert limiter.available_tokens == 4
+
+    async def test_acquire_on_behalf_of(self) -> None:
+        borrower = object()
+        limiter = WeightedCapacityLimiter(3)
+        await limiter.acquire_on_behalf_of(borrower, 2)
+        assert limiter.borrowed_tokens == 2
+        assert limiter.available_tokens == 1
+        assert limiter.statistics().borrowers == (borrower,)
+        limiter.release_on_behalf_of(borrower)
+        assert limiter.borrowed_tokens == 0
+        assert limiter.statistics().borrowers == ()
+
+    async def test_borrow_twice(self) -> None:
+        limiter = WeightedCapacityLimiter(4)
+        await limiter.acquire(2)
+        with pytest.raises(RuntimeError) as exc:
+            await limiter.acquire(1)
+
+        exc.match(
+            "this borrower is already holding tokens from this "
+            "WeightedCapacityLimiter"
+        )
+
+    async def test_borrow_twice_on_behalf_of(self) -> None:
+        borrower = object()
+        limiter = WeightedCapacityLimiter(4)
+        limiter.acquire_on_behalf_of_nowait(borrower, 1)
+        with pytest.raises(RuntimeError) as exc:
+            limiter.acquire_on_behalf_of_nowait(borrower, 2)
+
+        exc.match(
+            "this borrower is already holding tokens from this "
+            "WeightedCapacityLimiter"
+        )
+
+    async def test_bad_release(self) -> None:
+        limiter = WeightedCapacityLimiter(1)
+        with pytest.raises(RuntimeError) as exc:
+            limiter.release()
+
+        exc.match(
+            "this borrower isn't holding any tokens from this "
+            "WeightedCapacityLimiter"
+        )
+
+    async def test_acquire_nowait(self) -> None:
+        limiter = WeightedCapacityLimiter(3)
+        limiter.acquire_on_behalf_of_nowait("A", 2)
+        assert limiter.borrowed_tokens == 2
+        with pytest.raises(WouldBlock):
+            limiter.acquire_on_behalf_of_nowait("B", 2)
+
+        limiter.acquire_on_behalf_of_nowait("B", 1)
+        assert limiter.borrowed_tokens == 3
+
+    async def test_acquire_nowait_blocked_by_waiter(self) -> None:
+        # Even though a token is free, a non-blocking acquire must not bypass the
+        # already queued waiter
+        limiter = WeightedCapacityLimiter(3)
+        limiter.acquire_on_behalf_of_nowait("holder", 2)
+
+        async def waiter() -> None:
+            await limiter.acquire_on_behalf_of("B", 2)
+
+        async with create_task_group() as tg:
+            tg.start_soon(waiter)
+            await wait_all_tasks_blocked()
+            assert limiter.available_tokens == 1
+            assert limiter.statistics().tasks_waiting == 1
+            with pytest.raises(WouldBlock):
+                limiter.acquire_on_behalf_of_nowait("X", 1)
+
+            tg.cancel_scope.cancel()
+
+    async def test_grant_is_atomic(self) -> None:
+        # A request must only be granted once its entire weight fits in the
+        # available tokens; freed tokens must not be partially handed out
+        limiter = WeightedCapacityLimiter(4)
+        for name in ("A", "B", "C"):
+            limiter.acquire_on_behalf_of_nowait(name, 1)
+
+        acquired: list[tuple[str, int]] = []
+
+        async def borrower() -> None:
+            await limiter.acquire_on_behalf_of("big", 3)
+            acquired.append(("big", 3))
+
+        async with create_task_group() as tg:
+            tg.start_soon(borrower)
+            await wait_all_tasks_blocked()
+            limiter.release_on_behalf_of("A")
+            await wait_all_tasks_blocked()
+            assert acquired == []
+            assert limiter.borrowed_tokens == 2
+            limiter.release_on_behalf_of("B")
+            await wait_all_tasks_blocked()
+            assert acquired == [("big", 3)]
+            assert limiter.borrowed_tokens == 4
+            limiter.release_on_behalf_of("big")
+
+        assert limiter.borrowed_tokens == 1
+
+    async def test_fifo_no_overtake(self) -> None:
+        # A lighter request queued behind a heavier one must not be granted first,
+        # even if its weight would fit in the available tokens
+        limiter = WeightedCapacityLimiter(3)
+        limiter.acquire_on_behalf_of_nowait("holder", 2)
+        acquired: list[tuple[str, int]] = []
+
+        async def borrower(name: str, weight: int) -> None:
+            await limiter.acquire_on_behalf_of(name, weight)
+            acquired.append((name, weight))
+
+        async with create_task_group() as tg:
+            tg.start_soon(borrower, "heavy", 2)
+            await wait_all_tasks_blocked()
+            tg.start_soon(borrower, "light", 1)
+            await wait_all_tasks_blocked()
+            assert limiter.available_tokens == 1
+            assert limiter.statistics().tasks_waiting == 2
+            assert acquired == []
+            limiter.release_on_behalf_of("holder")
+
+        assert acquired == [("heavy", 2), ("light", 1)]
+        assert limiter.borrowed_tokens == 3
+
+    async def test_decrease_total_tokens_below_borrowed(self) -> None:
+        # Lowering the total below the borrowed amount must not disturb existing
+        # borrowers, but new acquisitions have to wait for the borrowed amount to
+        # drop below the total
+        limiter = WeightedCapacityLimiter(4)
+        limiter.acquire_on_behalf_of_nowait("A", 3)
+        limiter.acquire_on_behalf_of_nowait("B", 1)
+        acquired: list[tuple[str, int]] = []
+
+        async def borrower() -> None:
+            await limiter.acquire_on_behalf_of("C", 1)
+            acquired.append(("C", 1))
+
+        limiter.total_tokens = 2
+        assert limiter.borrowed_tokens == 4
+        async with create_task_group() as tg:
+            tg.start_soon(borrower)
+            await wait_all_tasks_blocked()
+            assert acquired == []
+            limiter.release_on_behalf_of("B")
+            await wait_all_tasks_blocked()
+            assert acquired == []
+            assert limiter.borrowed_tokens == 3
+            limiter.release_on_behalf_of("A")
+
+        assert acquired == [("C", 1)]
+        assert limiter.borrowed_tokens == 1
+
+    async def test_increase_tokens_wakes_multiple(self) -> None:
+        limiter = WeightedCapacityLimiter(1)
+        limiter.acquire_on_behalf_of_nowait("holder", 1)
+        acquired: list[tuple[str, int]] = []
+
+        async def borrower(name: str, weight: int) -> None:
+            await limiter.acquire_on_behalf_of(name, weight)
+            acquired.append((name, weight))
+
+        async with create_task_group() as tg:
+            tg.start_soon(borrower, "B", 1)
+            await wait_all_tasks_blocked()
+            tg.start_soon(borrower, "C", 2)
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_waiting == 2
+            limiter.total_tokens = 4
+            await wait_all_tasks_blocked()
+            assert acquired == [("B", 1), ("C", 2)]
+            assert limiter.borrowed_tokens == 4
+            limiter.release_on_behalf_of("holder")
+
+    async def test_acquire_cancelled_at_grant(self) -> None:
+        # If a waiter is cancelled at the exact moment its tokens are granted, the
+        # tokens must be returned to the pool
+        limiter = WeightedCapacityLimiter(1)
+        limiter.acquire_on_behalf_of_nowait("holder")
+
+        async def borrower(*, task_status: TaskStatus[CancelScope]) -> None:
+            with CancelScope() as scope:
+                task_status.started(scope)
+                await limiter.acquire_on_behalf_of("borrower", 1)
+
+        async with create_task_group() as tg:
+            scope = await tg.start(borrower)
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_waiting == 1
+
+            # Cancel the waiter and grant its token before it gets a chance to
+            # resume
+            scope.cancel()
+            limiter.release_on_behalf_of("holder")
+            await wait_all_tasks_blocked()
+            assert limiter.borrowed_tokens == 0
+            assert limiter.statistics().tasks_waiting == 0
+
+        # The limiter must still be fully usable
+        limiter.acquire_on_behalf_of_nowait("other", 1)
+        assert limiter.borrowed_tokens == 1
+
+    async def test_head_of_queue_cancelled(self) -> None:
+        # Cancelling the waiter at the head of the queue must let the next waiter
+        # proceed once enough tokens are available
+        limiter = WeightedCapacityLimiter(2)
+        limiter.acquire_on_behalf_of_nowait("holder", 2)
+        acquired: list[tuple[str, int]] = []
+
+        async def borrower(
+            name: str, weight: int, *, task_status: TaskStatus[CancelScope]
+        ) -> None:
+            with CancelScope() as scope:
+                task_status.started(scope)
+                await limiter.acquire_on_behalf_of(name, weight)
+                acquired.append((name, weight))
+
+        async with create_task_group() as tg:
+            scope_b = await tg.start(borrower, "B", 2)
+            await wait_all_tasks_blocked()
+            await tg.start(borrower, "C", 1)
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_waiting == 2
+            scope_b.cancel()
+            await wait_all_tasks_blocked()
+            assert limiter.statistics().tasks_waiting == 1
+            limiter.release_on_behalf_of("holder")
+
+        assert acquired == [("C", 1)]
+        assert limiter.borrowed_tokens == 1
+
+    async def test_statistics(self) -> None:
+        async def waiter() -> None:
+            await limiter.acquire(2)
+
+        limiter = WeightedCapacityLimiter(3)
+        statistics = limiter.statistics()
+        assert statistics.total_tokens == 3
+        assert statistics.borrowed_tokens == 0
+        assert statistics.borrowers == ()
+        assert statistics.tasks_waiting == 0
+        async with create_task_group() as tg:
+            await limiter.acquire(2)
+            assert limiter.statistics().borrowed_tokens == 2
+            tg.start_soon(waiter)
+            await wait_all_tasks_blocked()
+            statistics = limiter.statistics()
+            assert statistics.borrowed_tokens == 2
+            assert statistics.tasks_waiting == 1
+            tg.cancel_scope.cancel()
+
+        assert limiter.statistics().tasks_waiting == 0

@@ -5,6 +5,9 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``WeightedCapacityLimiter`` synchronization primitive, a capacity limiter
+  where each acquisition borrows a caller-specified number of tokens (its weight),
+  granted atomically and in first-come-first-served order
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends

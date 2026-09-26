@@ -226,6 +226,50 @@ Example::
     # Task number 8 is now working with the shared resource
     # Task number 9 is now working with the shared resource
 
+Weighted capacity limiters
+--------------------------
+
+Weighted capacity limiters (:class:`WeightedCapacityLimiter`) work like
+:class:`CapacityLimiter` except that each acquisition specifies how many tokens it
+needs (its *weight*, a positive integer). This is useful when the tasks contending for
+a resource have different costs, such as image transcoding jobs that each require a
+different amount of memory.
+
+Tokens are always granted as a whole: a request is only fulfilled once enough tokens
+are available to cover its entire weight. Waiting requests are fulfilled strictly in
+arrival order, so a later, lighter request cannot overtake an earlier one that is
+still waiting for enough tokens. Just like with :class:`CapacityLimiter`, tokens can
+be borrowed on behalf of arbitrary objects, and each borrower can only hold one grant
+at a time.
+
+Example::
+
+    from anyio import WeightedCapacityLimiter, create_task_group, sleep, run
+
+
+    async def transcode(image, weight, limiter):
+        await limiter.acquire_on_behalf_of(image, weight)
+        try:
+            print(f"Transcoding {image} (weight {weight})")
+            await sleep(1)
+        finally:
+            limiter.release_on_behalf_of(image)
+
+
+    async def main():
+        # Limit the total memory used by concurrent transcoding jobs
+        limiter = WeightedCapacityLimiter(4)
+        async with create_task_group() as tg:
+            for image, weight in [("a.png", 3), ("b.png", 2), ("c.png", 1)]:
+                tg.start_soon(transcode, image, weight, limiter)
+
+    run(main)
+
+    # Output:
+    # Transcoding a.png (weight 3)
+    # Transcoding b.png (weight 2)
+    # Transcoding c.png (weight 1)
+
 Resource guards
 ---------------
 
