@@ -16,8 +16,9 @@ from contextlib import (
     AbstractAsyncContextManager,
     AbstractContextManager,
     contextmanager,
+    suppress,
 )
-from contextvars import Context
+from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from functools import partial
 from inspect import isawaitable
@@ -31,12 +32,15 @@ from typing import (
     overload,
 )
 
+from . import to_thread
 from ._core._eventloop import (
+    current_async_library,
     get_cancelled_exc_class,
+    set_current_async_library,
     threadlocals,
 )
 from ._core._eventloop import run as run_eventloop
-from ._core._exceptions import NoEventLoopError
+from ._core._exceptions import NoEventLoopError, RunFinishedError
 from ._core._synchronization import Event
 from ._core._tasks import CancelScope, create_task_group
 from .abc._tasks import TaskStatus
@@ -245,6 +249,7 @@ class BlockingPortal:
         args: tuple[Unpack[PosArgsT]],
         kwargs: dict[str, Any],
         future: Future[T_Retval],
+        context: Context | None = None,
     ) -> None:
         event_loop_thread_id = self._event_loop_thread_id
 
@@ -258,6 +263,16 @@ class BlockingPortal:
                     )
 
         try:
+            if context is not None:
+                # Adopt the caller's context variables for the duration of this call.
+                # Each task runs in its own copy of the context, so this neither
+                # leaks to other tasks nor propagates changes back to the caller.
+                asynclib_name = current_async_library()
+                for var in context:
+                    var.set(context[var])
+
+                set_current_async_library(asynclib_name)
+
             retval_or_awaitable = func(*args, **kwargs)
             if isawaitable(retval_or_awaitable):
                 with CancelScope() as scope:
@@ -288,6 +303,7 @@ class BlockingPortal:
         kwargs: dict[str, Any],
         name: object,
         future: Future[T_Retval],
+        context: Context | None = None,
     ) -> None:
         """
         Spawn a new task using the given callable.
@@ -298,6 +314,8 @@ class BlockingPortal:
         :param name: name of the task (will be coerced to a string if not ``None``)
         :param future: a future that will resolve to the return value of the callable,
             or the exception raised during its execution
+        :param context: an optional context whose variables are adopted by the task
+            for the duration of the call
 
         """
         run_sync(
@@ -307,6 +325,7 @@ class BlockingPortal:
             args,
             kwargs,
             future,
+            context,
             token=self._token,
         )
 
@@ -338,6 +357,57 @@ class BlockingPortal:
 
         """
         return cast(T_Retval, self.start_task_soon(func, *args).result())
+
+    @overload
+    async def call_async(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Awaitable[T_Retval]],
+        *args: Unpack[PosArgsT],
+    ) -> T_Retval: ...
+
+    @overload
+    async def call_async(
+        self, func: Callable[[Unpack[PosArgsT]], T_Retval], *args: Unpack[PosArgsT]
+    ) -> T_Retval: ...
+
+    async def call_async(
+        self,
+        func: Callable[[Unpack[PosArgsT]], Awaitable[T_Retval] | T_Retval],
+        *args: Unpack[PosArgsT],
+    ) -> T_Retval:
+        """
+        Call the given function in the event loop thread and wait for the result
+        without blocking the calling event loop.
+
+        Unlike :meth:`call`, this method is asynchronous, so the event loop in the
+        calling thread remains free to schedule other tasks while waiting for the
+        result.
+
+        If the waiting task is cancelled, the cancellation is propagated to the
+        target call, but the portal itself and any other concurrent calls are left
+        unaffected.
+
+        The caller's context variables are propagated to the target call, but any
+        changes made to them by the target are not propagated back.
+
+        :param func: any callable
+        :raises RuntimeError: if the portal is not running or if this method is called
+            from within the event loop thread
+
+        .. versionadded:: 4.16.0
+
+        """
+        self._check_running()
+        context = copy_context()
+        future: Future[T_Retval] = Future()
+        self._spawn_task_from_thread(func, args, {}, None, future, context)
+        try:
+            return await to_thread.run_sync(future.result, abandon_on_cancel=True)
+        except get_cancelled_exc_class():
+            with suppress(RunFinishedError):
+                future.cancel()
+
+            raise
 
     @overload
     def start_task_soon(

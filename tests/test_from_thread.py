@@ -25,6 +25,7 @@ from anyio import (
     get_available_backends,
     get_cancelled_exc_class,
     get_current_task,
+    move_on_after,
     run,
     sleep,
     to_thread,
@@ -812,3 +813,155 @@ class TestBlockingPortal:
                 # Ensure thread has time to start the task
                 await event.wait()
                 await portal.stop(cancel_remaining=True)
+
+
+@pytest.mark.parametrize("portal_backend_name", get_available_backends())
+@pytest.mark.usefixtures("deactivate_blockbuster")
+class TestBlockingPortalCallAsync:
+    async def test_call_corofunc(self, portal_backend_name: str) -> None:
+        async def add(a: int, b: int) -> int:
+            await checkpoint()
+            return a + b
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            assert await portal.call_async(add, 1, 2) == 3
+
+    async def test_call_non_corofunc(self, portal_backend_name: str) -> None:
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            assert await portal.call_async(add, 1, 2) == 3
+
+    async def test_exception(self, portal_backend_name: str) -> None:
+        async def raiser() -> None:
+            await checkpoint()
+            raise ValueError("foo")
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            with pytest.raises(ValueError, match="foo"):
+                await portal.call_async(raiser)
+
+    async def test_does_not_block_event_loop(self, portal_backend_name: str) -> None:
+        flag = False
+
+        async def set_flag() -> None:
+            nonlocal flag
+            await sleep(0.1)
+            flag = True
+
+        async def slow_func() -> int:
+            await sleep(1)
+            return 3
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            with fail_after(10):
+                async with create_task_group() as tg:
+                    tg.start_soon(set_flag)
+                    assert await portal.call_async(slow_func) == 3
+                    # The other task must have run while the call was in progress
+                    assert flag
+
+    async def test_cancellation(self, portal_backend_name: str) -> None:
+        target_started = threading.Event()
+        target_cancelled = threading.Event()
+
+        async def cancellable_target() -> None:
+            target_started.set()
+            try:
+                await sleep(30)
+            finally:
+                target_cancelled.set()
+
+        async def slow_target() -> str:
+            await sleep(0.5)
+            return "slow target finished"
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            results: list[str] = []
+
+            async def call_cancellable() -> None:
+                with move_on_after(0.2) as scope:
+                    await portal.call_async(cancellable_target)
+
+                assert scope.cancelled_caught
+
+            async def call_slow() -> None:
+                results.append(await portal.call_async(slow_target))
+
+            with fail_after(10):
+                async with create_task_group() as tg:
+                    tg.start_soon(call_cancellable)
+                    tg.start_soon(call_slow)
+
+                # The cancellation must not have affected the concurrent call
+                assert results == ["slow target finished"]
+                assert target_started.is_set()
+                # The cancellation must have propagated to the target call
+                await to_thread.run_sync(target_cancelled.wait)
+                # The portal itself must still be usable
+                assert await portal.call_async(slow_target) == "slow target finished"
+
+    async def test_contextvar_propagation(self, portal_backend_name: str) -> None:
+        var: ContextVar[int] = ContextVar("var")
+        var.set(6)
+
+        async def read_and_modify() -> int:
+            await checkpoint()
+            value = var.get()
+            var.set(7)
+            return value
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            assert await portal.call_async(read_and_modify) == 6
+
+        # Changes made by the target must not propagate back to the caller
+        assert var.get() == 6
+
+    async def test_sniffio(
+        self, anyio_backend_name: str, portal_backend_name: str
+    ) -> None:
+        sniffio = pytest.importorskip("sniffio", reason="sniffio is not installed")
+
+        async def get_library() -> str:
+            await checkpoint()
+            return sniffio.current_async_library()
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            # The target must see the portal's async library, not the caller's
+            assert await portal.call_async(get_library) == portal_backend_name
+
+    async def test_call_from_event_loop_thread(self, portal_backend_name: str) -> None:
+        async def recursive_call() -> None:
+            with pytest.raises(
+                RuntimeError, match="cannot be called from the event loop thread"
+            ):
+                await portal.call_async(checkpoint)
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            portal.call(recursive_call)
+
+    async def test_call_not_running(self, portal_backend_name: str) -> None:
+        with start_blocking_portal(portal_backend_name) as portal:
+            pass
+
+        with pytest.raises(RuntimeError, match="portal is not running"):
+            await portal.call_async(checkpoint)
+
+    async def test_portal_stopped_during_call(self, portal_backend_name: str) -> None:
+        target_started = threading.Event()
+
+        async def wait_forever() -> None:
+            target_started.set()
+            await sleep(30)
+
+        with start_blocking_portal(portal_backend_name) as portal:
+            with fail_after(10):
+                async def stop_portal() -> None:
+                    await to_thread.run_sync(target_started.wait)
+                    await to_thread.run_sync(portal.call, portal.stop, True)
+
+                async with create_task_group() as tg:
+                    tg.start_soon(stop_portal)
+                    with pytest.raises(CancelledError):
+                        await portal.call_async(wait_forever)

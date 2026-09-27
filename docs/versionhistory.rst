@@ -5,6 +5,10 @@ This library adheres to `Semantic Versioning 2.0 <http://semver.org/>`_.
 
 **UNRELEASED**
 
+- Added the ``BlockingPortal.call_async()`` method which lets a task running in one
+  event loop await the result of a call made through a blocking portal running in
+  another thread, without blocking the calling event loop
+  (`#0000 <https://github.com/agronholm/anyio/pull/0000>`_; PR by @yourgithubaccount)
 - Fixed ``sleep()`` treating a negative delay (including ``-inf``) inconsistently
   across backends (asyncio returned immediately; Trio raised ``ValueError``) by
   raising ``ValueError`` on all backends
